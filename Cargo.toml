@@ -1,6 +1,6 @@
 [package]
 name = "anthropic-proxy"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 authors = ["m0n0x41d <zakutnii.ivan@gmail.com>"]
 description = "High-performance Anthropic API proxy to OpenAI-compatible endpoints"
@@ -42,6 +42,9 @@ dotenvy = "0.15"
 
 # CLI argument parsing
 clap = { version = "4.5", features = ["derive"] }
+
+# Daemonize
+daemonize = "0.5"
 
 # Server utilities
 tower = { version = "0.5", features = ["util"] }

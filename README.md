@@ -50,12 +50,21 @@ UPSTREAM_API_KEY=sk-... \
 anthropic-proxy --help
 ```
 
+**Commands:**
+| Command | Description |
+|---------|-------------|
+| `stop` | Stop running daemon |
+| `status` | Check daemon status |
+
+**Options:**
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--config <FILE>` | `-c` | Path to custom .env file |
 | `--debug` | `-d` | Enable debug logging |
 | `--verbose` | `-v` | Enable verbose logging (logs full request/response bodies) |
 | `--port <PORT>` | `-p` | Port to listen on (overrides PORT env var) |
+| `--daemon` | | Run as background daemon |
+| `--pid-file <FILE>` | | PID file path (default: `/tmp/anthropic-proxy.pid`) |
 | `--help` | `-h` | Print help information |
 | `--version` | `-V` | Print version |
 
@@ -92,8 +101,8 @@ If no `.env` file is found, the proxy uses environment variables from your shell
 ### With Claude Code
 
 ```bash
-# Start proxy in background and use Claude Code in one command
-anthropic-proxy & ANTHROPIC_BASE_URL=http://localhost:3000 claude
+# Start proxy as daemon and use Claude Code immediately
+anthropic-proxy --daemon && ANTHROPIC_BASE_URL=http://localhost:3000 claude
 
 # Or use separate terminals:
 # Terminal 1: Start proxy
@@ -143,6 +152,29 @@ UPSTREAM_BASE_URL=https://openrouter.ai/api \
 # This allows cost optimization: use powerful models for complex reasoning,
 # and faster/cheaper models for simple completions
 ```
+
+### Running as Daemon
+
+```bash
+# Start as background daemon
+anthropic-proxy --daemon
+
+# Check daemon status
+anthropic-proxy status
+
+# Stop daemon
+anthropic-proxy stop
+
+# View daemon logs
+tail -f /tmp/anthropic-proxy.log
+
+# Custom PID file location
+anthropic-proxy --daemon --pid-file ~/.anthropic-proxy.pid
+anthropic-proxy stop --pid-file ~/.anthropic-proxy.pid
+```
+
+> **Note**: When running as daemon, logs are written to `/tmp/anthropic-proxy.log`
+
 ## Supported Features
 
 ✅ Text messages  
