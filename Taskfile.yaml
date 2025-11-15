@@ -1,0 +1,198 @@
+version: '3'
+
+vars:
+  BINARY_NAME: anthropic-proxy
+  INSTALL_DIR: '{{.HOME}}/.cargo/bin'
+  BUILD_DIR: target/release
+
+tasks:
+  default:
+    desc: Show available tasks
+    cmds:
+      - task --list
+
+  build:
+    desc: Build release binary
+    cmds:
+      - cargo build --release
+    sources:
+      - src/**/*.rs
+      - Cargo.toml
+      - Cargo.lock
+    generates:
+      - '{{.BUILD_DIR}}/{{.BINARY_NAME}}'
+
+  build-dev:
+    desc: Build debug binary
+    cmds:
+      - cargo build
+
+  install:
+    desc: Build and install to ~/.cargo/bin
+    deps: [build]
+    cmds:
+      - cp {{.BUILD_DIR}}/{{.BINARY_NAME}} {{.INSTALL_DIR}}/{{.BINARY_NAME}}
+      - chmod +x {{.INSTALL_DIR}}/{{.BINARY_NAME}}
+      - echo "✅ Installed to {{.INSTALL_DIR}}/{{.BINARY_NAME}}"
+
+  local-install:
+    desc: Build and install to ~/.cargo/bin (alias for install)
+    cmds:
+      - task: install
+
+  uninstall:
+    desc: Remove installed binary
+    cmds:
+      - rm -f {{.INSTALL_DIR}}/{{.BINARY_NAME}}
+      - echo "✅ Uninstalled {{.BINARY_NAME}}"
+
+  run:
+    desc: Run in development mode
+    cmds:
+      - cargo run
+
+  run-release:
+    desc: Run release build
+    deps: [build]
+    cmds:
+      - ./{{.BUILD_DIR}}/{{.BINARY_NAME}}
+
+  test:
+    desc: Run all tests
+    cmds:
+      - cargo test
+
+  test-verbose:
+    desc: Run tests with verbose output
+    cmds:
+      - cargo test -- --nocapture --test-threads=1
+
+  fmt:
+    desc: Format code
+    cmds:
+      - cargo fmt
+
+  fmt-check:
+    desc: Check code formatting
+    cmds:
+      - cargo fmt -- --check
+
+  lint:
+    desc: Run clippy linter
+    cmds:
+      - cargo clippy -- -D warnings
+
+  lint-fix:
+    desc: Run clippy with auto-fix
+    cmds:
+      - cargo clippy --fix --allow-dirty --allow-staged
+
+  check:
+    desc: Run all checks (fmt, lint, test)
+    cmds:
+      - task: fmt-check
+      - task: lint
+      - task: test
+
+  clean:
+    desc: Clean build artifacts
+    cmds:
+      - cargo clean
+      - echo "✅ Cleaned build artifacts"
+
+  watch:
+    desc: Watch and auto-reload on changes
+    cmds:
+      - cargo watch -x run
+
+  watch-test:
+    desc: Watch and run tests on changes
+    cmds:
+      - cargo watch -x test
+
+  audit:
+    desc: Check for security vulnerabilities
+    cmds:
+      - cargo audit
+
+  update:
+    desc: Update dependencies
+    cmds:
+      - cargo update
+
+  size:
+    desc: Show binary size
+    deps: [build]
+    cmds:
+      - ls -lh {{.BUILD_DIR}}/{{.BINARY_NAME}} | awk '{print "Binary size:", $5}'
+      - file {{.BUILD_DIR}}/{{.BINARY_NAME}}
+
+  bench:
+    desc: Run benchmarks (if any)
+    cmds:
+      - cargo bench
+
+  doc:
+    desc: Generate and open documentation
+    cmds:
+      - cargo doc --open --no-deps
+
+  tree:
+    desc: Show dependency tree
+    cmds:
+      - cargo tree
+
+  outdated:
+    desc: Check for outdated dependencies
+    cmds:
+      - cargo outdated
+
+  release:
+    desc: Prepare for release (check, build, test)
+    cmds:
+      - task: clean
+      - task: check
+      - task: build
+      - task: size
+      - echo "✅ Release build ready at {{.BUILD_DIR}}/{{.BINARY_NAME}}"
+
+  dev:
+    desc: Start development server with auto-reload
+    cmds:
+      - task: watch
+
+  start:
+    desc: Start the proxy server (release mode)
+    deps: [build]
+    cmds:
+      - |
+        if [ -z "$UPSTREAM_BASE_URL" ]; then
+          echo "⚠️  Error: UPSTREAM_BASE_URL is required"
+          echo "Set it with: export UPSTREAM_BASE_URL=https://openrouter.ai/api"
+          echo "Or OpenAI: export UPSTREAM_BASE_URL=https://api.openai.com"
+          echo "Or local: export UPSTREAM_BASE_URL=http://localhost:11434"
+          exit 1
+        fi
+        ./{{.BUILD_DIR}}/{{.BINARY_NAME}}
+
+  help:
+    desc: Show help information
+    cmds:
+      - echo "anthropic-proxy-rs - Anthropic API to OpenAI proxy"
+      - echo ""
+      - echo "Common tasks:"
+      - echo "  task build          - Build release binary"
+      - echo "  task install        - Build and install to ~/.cargo/bin"
+      - echo "  task run            - Run in development mode"
+      - echo "  task dev            - Start with auto-reload"
+      - echo "  task test           - Run tests"
+      - echo "  task check          - Run all checks"
+      - echo "  task clean          - Clean build artifacts"
+      - echo ""
+      - echo "Environment variables:"
+      - echo "  UPSTREAM_BASE_URL            - Upstream endpoint URL (required)"
+      - echo "  UPSTREAM_API_KEY             - API key for upstream service"
+      - echo "  PORT                         - Server port (default 3000)"
+      - echo "  REASONING_MODEL              - Override model for thinking mode"
+      - echo "  COMPLETION_MODEL             - Override model for standard mode"
+      - echo "  DEBUG                        - Enable debug logging (1 or true)"

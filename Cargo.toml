@@ -1,0 +1,60 @@
+[package]
+name = "anthropic-proxy"
+version = "1.0.0"
+edition = "2021"
+authors = ["m0n0x41d <zakutnii.ivan@gmail.com>"]
+description = "High-performance Anthropic API proxy to OpenAI-compatible endpoints"
+license = "MIT"
+repository = "https://github.com/m0n0x41d/anthropic-proxy-rs"
+
+[[bin]]
+name = "anthropic-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros"] }
+
+# Web framework
+axum = { version = "0.7", features = ["http2"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async utilities
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Environment variables
+dotenvy = "0.15"
+
+# CLI argument parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Server utilities
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+
+# Async streams
+async-stream = "0.3"
+bytes = "1.9"
+pin-project = "1.1"
+
+[profile.release]
+opt-level = "z"        # Optimize for size
+lto = true             # Enable Link Time Optimization
+codegen-units = 1      # Better optimization
+strip = true           # Strip symbols for smaller binary
+panic = "abort"        # Smaller binary
