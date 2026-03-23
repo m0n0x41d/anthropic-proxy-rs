@@ -153,6 +153,23 @@ pub struct Usage {
     pub output_tokens: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsListResponse {
+    pub data: Vec<ModelInfo>,
+    pub first_id: Option<String>,
+    pub has_more: bool,
+    pub last_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub created_at: String,
+    pub display_name: String,
+    pub id: String,
+    #[serde(rename = "type")]
+    pub model_type: String,
+}
+
 /// Streaming event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]

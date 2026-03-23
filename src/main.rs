@@ -5,7 +5,10 @@ mod models;
 mod proxy;
 mod transform;
 
-use axum::{routing::post, Extension, Router};
+use axum::{
+    routing::{get, post},
+    Extension, Router,
+};
 use clap::Parser;
 use cli::{Cli, Command};
 use config::Config;
@@ -132,6 +135,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/v1/messages", post(proxy::proxy_handler))
+        .route("/v1/models", get(proxy::list_models_handler))
         .route("/health", axum::routing::get(health_handler))
         .layer(Extension(config.clone()))
         .layer(Extension(client))

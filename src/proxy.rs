@@ -48,6 +48,43 @@ pub async fn proxy_handler(
     }
 }
 
+pub async fn list_models_handler(
+    Extension(config): Extension<Arc<Config>>,
+    Extension(client): Extension<Client>,
+) -> ProxyResult<Response> {
+    let url = config.models_url();
+    tracing::debug!("Fetching models from {}", url);
+
+    let mut req_builder = client.get(&url).timeout(Duration::from_secs(60));
+
+    if let Some(api_key) = &config.api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    let response = req_builder.send().await.map_err(|err| {
+        tracing::error!("Failed to fetch models from {}: {:?}", url, err);
+        ProxyError::Http(err)
+    })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        tracing::error!("Upstream models error ({}): {}", status, error_text);
+        return Err(ProxyError::Upstream(format!(
+            "Upstream returned {}: {}",
+            status, error_text
+        )));
+    }
+
+    let openai_resp: openai::ModelsListResponse = response.json().await?;
+    let anthropic_resp = transform::openai_models_to_anthropic(openai_resp);
+
+    Ok(Json(anthropic_resp).into_response())
+}
+
 async fn handle_non_streaming(
     config: Arc<Config>,
     client: Client,
