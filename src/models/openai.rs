@@ -121,6 +121,24 @@ pub struct Usage {
     pub total_tokens: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsListResponse {
+    #[serde(default)]
+    pub object: Option<String>,
+    pub data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub owned_by: Option<String>,
+}
+
 /// Streaming chunk structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {

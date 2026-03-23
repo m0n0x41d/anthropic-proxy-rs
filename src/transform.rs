@@ -282,6 +282,31 @@ pub fn openai_to_anthropic(
     })
 }
 
+pub fn openai_models_to_anthropic(
+    resp: openai::ModelsListResponse,
+) -> anthropic::ModelsListResponse {
+    let data: Vec<_> = resp
+        .data
+        .into_iter()
+        .map(|model| anthropic::ModelInfo {
+            created_at: "1970-01-01T00:00:00Z".to_string(),
+            display_name: model.id.clone(),
+            id: model.id,
+            model_type: "model".to_string(),
+        })
+        .collect();
+
+    let first_id = data.first().map(|model| model.id.clone());
+    let last_id = data.last().map(|model| model.id.clone());
+
+    anthropic::ModelsListResponse {
+        data,
+        first_id,
+        has_more: false,
+        last_id,
+    }
+}
+
 /// Map OpenAI finish reason to Anthropic stop reason
 pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
     finish_reason.map(|r| match r {
@@ -290,4 +315,72 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
         "length" => "max_tokens",
         _ => "end_turn",
     }.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::models::openai;
+
+    #[test]
+    fn openai_models_are_mapped_to_anthropic_shape() {
+        let response = openai::ModelsListResponse {
+            object: Some("list".to_string()),
+            data: vec![
+                openai::ModelInfo {
+                    id: "openai/gpt-4o-mini".to_string(),
+                    object: Some("model".to_string()),
+                    created: None,
+                    owned_by: Some("azure".to_string()),
+                },
+                openai::ModelInfo {
+                    id: "openai/gpt-5-chat".to_string(),
+                    object: Some("model".to_string()),
+                    created: None,
+                    owned_by: Some("azure".to_string()),
+                },
+            ],
+        };
+
+        let anthropic = super::openai_models_to_anthropic(response);
+
+        assert_eq!(anthropic.first_id.as_deref(), Some("openai/gpt-4o-mini"));
+        assert_eq!(anthropic.last_id.as_deref(), Some("openai/gpt-5-chat"));
+        assert!(!anthropic.has_more);
+        assert_eq!(anthropic.data[0].model_type, "model");
+    }
+
+    #[test]
+    fn empty_models_list_produces_empty_response() {
+        let response = openai::ModelsListResponse {
+            object: Some("list".to_string()),
+            data: vec![],
+        };
+
+        let anthropic = super::openai_models_to_anthropic(response);
+
+        assert!(anthropic.data.is_empty());
+        assert!(anthropic.first_id.is_none());
+        assert!(anthropic.last_id.is_none());
+        assert!(!anthropic.has_more);
+    }
+
+    #[test]
+    fn single_model_has_same_first_and_last_id() {
+        let response = openai::ModelsListResponse {
+            object: None,
+            data: vec![openai::ModelInfo {
+                id: "only-model".to_string(),
+                object: None,
+                created: None,
+                owned_by: None,
+            }],
+        };
+
+        let anthropic = super::openai_models_to_anthropic(response);
+
+        assert_eq!(anthropic.first_id.as_deref(), Some("only-model"));
+        assert_eq!(anthropic.last_id.as_deref(), Some("only-model"));
+        assert_eq!(anthropic.data.len(), 1);
+        assert_eq!(anthropic.data[0].display_name, "only-model");
+    }
 }
