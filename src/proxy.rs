@@ -26,13 +26,19 @@ pub async fn proxy_handler(
     tracing::debug!("Streaming: {}", is_streaming);
 
     if config.verbose {
-        tracing::trace!("Incoming Anthropic request: {}", serde_json::to_string_pretty(&req).unwrap_or_default());
+        tracing::trace!(
+            "Incoming Anthropic request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default()
+        );
     }
 
     let openai_req = transform::anthropic_to_openai(req, &config)?;
 
     if config.verbose {
-        tracing::trace!("Transformed OpenAI request: {}", serde_json::to_string_pretty(&openai_req).unwrap_or_default());
+        tracing::trace!(
+            "Transformed OpenAI request: {}",
+            serde_json::to_string_pretty(&openai_req).unwrap_or_default()
+        );
     }
 
     if is_streaming {
@@ -52,7 +58,7 @@ async fn handle_non_streaming(
     tracing::debug!("Request model: {}", openai_req.model);
 
     let mut req_builder = client
-        .post(&config.chat_completions_url())
+        .post(&url)
         .json(&openai_req)
         .timeout(Duration::from_secs(300));
 
@@ -78,13 +84,19 @@ async fn handle_non_streaming(
     let openai_resp: openai::OpenAIResponse = response.json().await?;
 
     if config.verbose {
-        tracing::trace!("Received OpenAI response: {}", serde_json::to_string_pretty(&openai_resp).unwrap_or_default());
+        tracing::trace!(
+            "Received OpenAI response: {}",
+            serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
+        );
     }
 
     let anthropic_resp = transform::openai_to_anthropic(openai_resp)?;
 
     if config.verbose {
-        tracing::trace!("Transformed Anthropic response: {}", serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default());
+        tracing::trace!(
+            "Transformed Anthropic response: {}",
+            serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default()
+        );
     }
 
     Ok(Json(anthropic_resp).into_response())
@@ -100,7 +112,7 @@ async fn handle_streaming(
     tracing::debug!("Request model: {}", openai_req.model);
 
     let mut req_builder = client
-        .post(&config.chat_completions_url())
+        .post(&url)
         .json(&openai_req)
         .timeout(Duration::from_secs(300));
 
@@ -116,12 +128,7 @@ async fn handle_streaming(
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        tracing::error!(
-            "Upstream error ({}) from {}: {}", 
-            status,
-            url,
-            error_text
-        );
+        tracing::error!("Upstream error ({}) from {}: {}", status, url, error_text);
         return Err(ProxyError::Upstream(format!(
             "Upstream returned {} from {}: {}",
             status, url, error_text
@@ -132,7 +139,10 @@ async fn handle_streaming(
     let sse_stream = create_sse_stream(stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 

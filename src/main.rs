@@ -5,10 +5,7 @@ mod models;
 mod proxy;
 mod transform;
 
-use axum::{
-    routing::post,
-    Extension, Router,
-};
+use axum::{routing::post, Extension, Router};
 use clap::Parser;
 use cli::{Cli, Command};
 use config::Config;
@@ -36,15 +33,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
-    
+
     if cli.daemon {
         use std::fs::OpenOptions;
-        
+
         let stdout = OpenOptions::new()
             .create(true)
             .append(true)
             .open("/tmp/anthropic-proxy.log")?;
-        
+
         let stderr = OpenOptions::new()
             .create(true)
             .append(true)
@@ -58,7 +55,7 @@ fn main() -> anyhow::Result<()> {
             .umask(0o027);
 
         match daemonize.start() {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 eprintln!("✗ Failed to daemonize: {}", e);
                 std::process::exit(1);
@@ -104,6 +101,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     tracing::info!("Starting Anthropic Proxy v{}", env!("CARGO_PKG_VERSION"));
     tracing::info!("Port: {}", config.port);
     tracing::info!("Upstream URL: {}", config.base_url);
+    tracing::info!(
+        "Resolved upstream chat completions URL: {}",
+        config.chat_completions_url()
+    );
     if let Some(ref model) = config.reasoning_model {
         tracing::info!("Reasoning Model Override: {}", model);
     }
@@ -160,15 +161,15 @@ fn stop_daemon(pid_file: &std::path::Path) -> anyhow::Result<()> {
     }
 
     let pid_str = std::fs::read_to_string(pid_file)?;
-    let pid: i32 = pid_str.trim().parse()
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow::anyhow!("Invalid PID in file: {}", pid_str))?;
 
     #[cfg(unix)]
     {
         use std::process::Command;
-        let output = Command::new("kill")
-            .arg(pid.to_string())
-            .output()?;
+        let output = Command::new("kill").arg(pid.to_string()).output()?;
 
         if output.status.success() {
             std::fs::remove_file(pid_file)?;
@@ -198,23 +199,26 @@ fn check_status(pid_file: &std::path::Path) -> anyhow::Result<()> {
     }
 
     let pid_str = std::fs::read_to_string(pid_file)?;
-    let pid: i32 = pid_str.trim().parse()
+    let pid: i32 = pid_str
+        .trim()
+        .parse()
         .map_err(|_| anyhow::anyhow!("Invalid PID in file: {}", pid_str))?;
 
     #[cfg(unix)]
     {
         use std::process::Command;
-        let output = Command::new("ps")
-            .arg("-p")
-            .arg(pid.to_string())
-            .output()?;
+        let output = Command::new("ps").arg("-p").arg(pid.to_string()).output()?;
 
         if output.status.success() {
             eprintln!("✓ Daemon is running (PID: {})", pid);
             eprintln!("  PID file: {}", pid_file.display());
         } else {
             eprintln!("✗ Daemon is not running");
-            eprintln!("  Stale PID file found: {} (PID: {})", pid_file.display(), pid);
+            eprintln!(
+                "  Stale PID file found: {} (PID: {})",
+                pid_file.display(),
+                pid
+            );
             std::process::exit(1);
         }
     }
