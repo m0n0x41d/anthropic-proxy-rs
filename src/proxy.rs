@@ -26,13 +26,19 @@ pub async fn proxy_handler(
     tracing::debug!("Streaming: {}", is_streaming);
 
     if config.verbose {
-        tracing::trace!("Incoming Anthropic request: {}", serde_json::to_string_pretty(&req).unwrap_or_default());
+        tracing::trace!(
+            "Incoming Anthropic request: {}",
+            serde_json::to_string_pretty(&req).unwrap_or_default()
+        );
     }
 
     let openai_req = transform::anthropic_to_openai(req, &config)?;
 
     if config.verbose {
-        tracing::trace!("Transformed OpenAI request: {}", serde_json::to_string_pretty(&openai_req).unwrap_or_default());
+        tracing::trace!(
+            "Transformed OpenAI request: {}",
+            serde_json::to_string_pretty(&openai_req).unwrap_or_default()
+        );
     }
 
     if is_streaming {
@@ -52,7 +58,7 @@ async fn handle_non_streaming(
     tracing::debug!("Request model: {}", openai_req.model);
 
     let mut req_builder = client
-        .post(&config.chat_completions_url())
+        .post(&url)
         .json(&openai_req)
         .timeout(Duration::from_secs(300));
 
@@ -60,7 +66,10 @@ async fn handle_non_streaming(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
-    let response = req_builder.send().await?;
+    let response = req_builder.send().await.map_err(|err| {
+        tracing::error!("Failed to send non-streaming request to {}: {:?}", url, err);
+        ProxyError::Http(err)
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -78,13 +87,19 @@ async fn handle_non_streaming(
     let openai_resp: openai::OpenAIResponse = response.json().await?;
 
     if config.verbose {
-        tracing::trace!("Received OpenAI response: {}", serde_json::to_string_pretty(&openai_resp).unwrap_or_default());
+        tracing::trace!(
+            "Received OpenAI response: {}",
+            serde_json::to_string_pretty(&openai_resp).unwrap_or_default()
+        );
     }
 
-    let anthropic_resp = transform::openai_to_anthropic(openai_resp)?;
+    let anthropic_resp = transform::openai_to_anthropic(openai_resp, &openai_req.model)?;
 
     if config.verbose {
-        tracing::trace!("Transformed Anthropic response: {}", serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default());
+        tracing::trace!(
+            "Transformed Anthropic response: {}",
+            serde_json::to_string_pretty(&anthropic_resp).unwrap_or_default()
+        );
     }
 
     Ok(Json(anthropic_resp).into_response())
@@ -100,7 +115,7 @@ async fn handle_streaming(
     tracing::debug!("Request model: {}", openai_req.model);
 
     let mut req_builder = client
-        .post(&config.chat_completions_url())
+        .post(&url)
         .json(&openai_req)
         .timeout(Duration::from_secs(300));
 
@@ -108,7 +123,10 @@ async fn handle_streaming(
         req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
     }
 
-    let response = req_builder.send().await?;
+    let response = req_builder.send().await.map_err(|err| {
+        tracing::error!("Failed to send streaming request to {}: {:?}", url, err);
+        ProxyError::Http(err)
+    })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -116,12 +134,7 @@ async fn handle_streaming(
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        tracing::error!(
-            "Upstream error ({}) from {}: {}", 
-            status,
-            url,
-            error_text
-        );
+        tracing::error!("Upstream error ({}) from {}: {}", status, url, error_text);
         return Err(ProxyError::Upstream(format!(
             "Upstream returned {} from {}: {}",
             status, url, error_text
@@ -129,10 +142,13 @@ async fn handle_streaming(
     }
 
     let stream = response.bytes_stream();
-    let sse_stream = create_sse_stream(stream);
+    let sse_stream = create_sse_stream(stream, openai_req.model.clone());
 
     let mut headers = HeaderMap::new();
-    headers.insert("Content-Type", HeaderValue::from_static("text/event-stream"));
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_static("text/event-stream"),
+    );
     headers.insert("Cache-Control", HeaderValue::from_static("no-cache"));
     headers.insert("Connection", HeaderValue::from_static("keep-alive"));
 
@@ -141,6 +157,7 @@ async fn handle_streaming(
 
 fn create_sse_stream(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    fallback_model: String,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -181,20 +198,25 @@ fn create_sse_stream(
 
                                 if let Ok(chunk) = serde_json::from_str::<openai::StreamChunk>(data) {
                                     if message_id.is_none() {
-                                        message_id = Some(chunk.id.clone());
+                                        if let Some(id) = &chunk.id {
+                                            message_id = Some(id.clone());
+                                        }
                                     }
                                     if current_model.is_none() {
-                                        current_model = Some(chunk.model.clone());
+                                        if let Some(model) = &chunk.model {
+                                            current_model = Some(model.clone());
+                                        }
                                     }
 
                                     if let Some(choice) = chunk.choices.first() {
+
                                         if !has_sent_message_start {
                                             let event = anthropic::StreamEvent::MessageStart {
                                                 message: anthropic::MessageStartData {
-                                                    id: message_id.clone().unwrap_or_default(),
+                                                    id: message_id.clone().unwrap_or_else(|| "msg_proxy".to_string()),
                                                     message_type: "message".to_string(),
                                                     role: "assistant".to_string(),
-                                                    model: current_model.clone().unwrap_or_default(),
+                                                    model: current_model.clone().unwrap_or_else(|| fallback_model.clone()),
                                                     usage: anthropic::Usage {
                                                         input_tokens: 0,
                                                         output_tokens: 0,
@@ -370,6 +392,8 @@ fn create_sse_stream(
                                             yield Ok(Bytes::from(sse_data));
                                         }
                                     }
+                                } else {
+                                    tracing::debug!("Ignoring unrecognized upstream stream chunk: {}", data);
                                 }
                             }
                         }

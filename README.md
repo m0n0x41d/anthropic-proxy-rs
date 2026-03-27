@@ -85,6 +85,11 @@ Configuration can be set via environment variables or `.env` file:
 \* Required if your upstream endpoint needs authentication  
 \*\* The proxy automatically detects when a request has extended thinking enabled (via the `thinking` parameter in the request) and routes it to `REASONING_MODEL`. Standard requests without thinking use `COMPLETION_MODEL`. This allows you to use more powerful models for reasoning tasks and faster/cheaper models for simple completions. If not set, the model from the client request is used.
 
+`UPSTREAM_BASE_URL` accepts any of these forms:
+- Service base URL: `https://api.openai.com` -> `/v1/chat/completions`
+- Versioned base URL: `https://gateway.company.internal/v2` -> `/v2/chat/completions`
+- Full endpoint: `https://gateway.company.internal/v2/chat/completions`
+
 ### Configuration File Locations
 
 The proxy searches for `.env` files in the following order:
@@ -218,11 +223,13 @@ The following Anthropic API features are **not supported** currently (Claude Cod
   - OpenAI: `https://api.openai.com`
   - Local: `http://localhost:11434`
 
-**Error: `405 Method Not Allowed`**  
-→ Your `UPSTREAM_BASE_URL` likely ends with `/v1`. Remove it!
-  - ❌ Wrong: `https://openrouter.ai/api/v1`
-  - ✅ Correct: `https://openrouter.ai/api`
-  - The proxy automatically adds `/v1/chat/completions`
+**Error: `405 Method Not Allowed` or wrong upstream path**  
+→ Check how `UPSTREAM_BASE_URL` is being resolved:
+  - `https://api.openai.com` -> `https://api.openai.com/v1/chat/completions`
+  - `https://openrouter.ai/api` -> `https://openrouter.ai/api/v1/chat/completions`
+  - `https://gateway.company.internal/v2` -> `https://gateway.company.internal/v2/chat/completions`
+  - `https://gateway.company.internal/v2/chat/completions` -> used as-is
+  - Partial paths like `.../chat` and URLs with query strings/fragments are rejected
 
 **Model not found errors**  
 → Set `REASONING_MODEL` and `COMPLETION_MODEL` to override the models from client requests

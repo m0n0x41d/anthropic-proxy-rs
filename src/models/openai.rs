@@ -87,10 +87,14 @@ pub struct Function {
 /// OpenAI API response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIResponse {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub choices: Vec<Choice>,
     pub usage: Usage,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -124,10 +128,14 @@ pub struct Usage {
 /// Streaming chunk structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamChunk {
-    pub id: String,
-    pub object: String,
-    pub created: u64,
-    pub model: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub created: Option<u64>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub choices: Vec<StreamChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,

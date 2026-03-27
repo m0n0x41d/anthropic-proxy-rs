@@ -223,6 +223,7 @@ fn clean_schema(mut schema: Value) -> Value {
 /// Transform OpenAI response to Anthropic format
 pub fn openai_to_anthropic(
     resp: openai::OpenAIResponse,
+    fallback_model: &str,
 ) -> ProxyResult<anthropic::AnthropicResponse> {
     let choice = resp
         .choices
@@ -268,11 +269,11 @@ pub fn openai_to_anthropic(
         .map(String::from);
 
     Ok(anthropic::AnthropicResponse {
-        id: resp.id,
+        id: resp.id.unwrap_or_else(|| "msg_proxy".to_string()),
         response_type: "message".to_string(),
         role: "assistant".to_string(),
         content,
-        model: resp.model,
+        model: resp.model.unwrap_or_else(|| fallback_model.to_string()),
         stop_reason,
         stop_sequence: None,
         usage: anthropic::Usage {
@@ -290,4 +291,72 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
         "length" => "max_tokens",
         _ => "end_turn",
     }.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::openai_to_anthropic;
+    use crate::models::openai;
+
+    #[test]
+    fn openai_response_allows_missing_metadata_fields() {
+        let response = openai::OpenAIResponse {
+            id: None,
+            object: None,
+            created: None,
+            model: None,
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("pong".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = openai_to_anthropic(response, "openai/gpt-4o-mini").unwrap();
+
+        assert_eq!(anthropic.id, "msg_proxy");
+        assert_eq!(anthropic.model, "openai/gpt-4o-mini");
+        assert_eq!(anthropic.usage.input_tokens, 10);
+        assert_eq!(anthropic.usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn openai_response_with_all_fields_present_uses_them() {
+        let response = openai::OpenAIResponse {
+            id: Some("chatcmpl-abc123".to_string()),
+            object: Some("chat.completion".to_string()),
+            created: Some(1700000000),
+            model: Some("gpt-4o".to_string()),
+            choices: vec![openai::Choice {
+                index: 0,
+                message: openai::ChoiceMessage {
+                    role: "assistant".to_string(),
+                    content: Some("hello".to_string()),
+                    tool_calls: None,
+                },
+                finish_reason: Some("stop".to_string()),
+            }],
+            usage: openai::Usage {
+                prompt_tokens: 5,
+                completion_tokens: 1,
+                total_tokens: 6,
+            },
+            system_fingerprint: None,
+        };
+
+        let anthropic = openai_to_anthropic(response, "fallback-model").unwrap();
+
+        assert_eq!(anthropic.id, "chatcmpl-abc123");
+        assert_eq!(anthropic.model, "gpt-4o");
+    }
 }
