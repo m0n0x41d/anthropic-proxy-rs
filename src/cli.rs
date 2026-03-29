@@ -30,6 +30,10 @@ pub struct Cli {
     #[arg(short, long, value_name = "PORT")]
     pub port: Option<u16>,
 
+    /// System prompt terms to remove before forwarding upstream (semicolon-separated or repeated)
+    #[arg(long, value_name = "TEXT", value_delimiter = ';')]
+    pub system_prompt_ignore: Vec<String>,
+
     /// Run as background daemon
     #[arg(long)]
     pub daemon: bool,

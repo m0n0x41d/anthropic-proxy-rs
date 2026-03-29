@@ -36,7 +36,9 @@ pub fn anthropic_to_openai(
             anthropic::SystemPrompt::Single(text) => {
                 openai_messages.push(openai::Message {
                     role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(text)),
+                    content: Some(openai::MessageContent::Text(sanitize_system_prompt(
+                        text, config,
+                    ))),
                     tool_calls: None,
                     tool_call_id: None,
                     name: None,
@@ -46,7 +48,9 @@ pub fn anthropic_to_openai(
                 for msg in messages {
                     openai_messages.push(openai::Message {
                         role: "system".to_string(),
-                        content: Some(openai::MessageContent::Text(msg.text)),
+                        content: Some(openai::MessageContent::Text(sanitize_system_prompt(
+                            msg.text, config,
+                        ))),
                         tool_calls: None,
                         tool_call_id: None,
                         name: None,
@@ -197,27 +201,177 @@ fn convert_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Message>>
     Ok(result)
 }
 
-/// Clean JSON schema by removing unsupported formats
-fn clean_schema(mut schema: Value) -> Value {
-    if let Some(obj) = schema.as_object_mut() {
-        // Remove "format": "uri"
-        if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
-            obj.remove("format");
-        }
+fn sanitize_system_prompt(text: String, config: &Config) -> String {
+    let mut sanitized = text;
+    let mut removed_terms = Vec::new();
 
-        // Recursively clean nested schemas
-        if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
-            for (_, value) in properties.iter_mut() {
-                *value = clean_schema(value.clone());
-            }
-        }
-
-        if let Some(items) = obj.get_mut("items") {
-            *items = clean_schema(items.clone());
+    for term in &config.system_prompt_ignore_terms {
+        let next = remove_ignored_term(&sanitized, term);
+        if next != sanitized {
+            sanitized = next;
+            removed_terms.push(term.clone());
         }
     }
 
-    schema
+    if !removed_terms.is_empty() {
+        tracing::debug!(
+            "Removed configured system prompt terms for upstream compatibility: {}",
+            removed_terms.join("; ")
+        );
+    }
+
+    sanitized
+}
+
+fn remove_ignored_term(text: &str, term: &str) -> String {
+    let tokens: Vec<Vec<u8>> = term
+        .split_whitespace()
+        .map(|token| {
+            token
+                .as_bytes()
+                .iter()
+                .map(u8::to_ascii_lowercase)
+                .collect()
+        })
+        .collect();
+
+    if tokens.is_empty() {
+        return text.to_string();
+    }
+
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if let Some(end) = match_ignore_term_at(bytes, index, &tokens) {
+            spans.push((index, end));
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+
+    if spans.is_empty() {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    for (start, end) in spans {
+        result.push_str(&text[cursor..start]);
+        cursor = end;
+    }
+
+    result.push_str(&text[cursor..]);
+    result
+}
+
+fn match_ignore_term_at(text: &[u8], start: usize, tokens: &[Vec<u8>]) -> Option<usize> {
+    let mut index = start;
+
+    if requires_boundary(text.get(start).copied())
+        && is_boundary_char(text.get(start.wrapping_sub(1)).copied())
+    {
+        return None;
+    }
+
+    for (token_index, token) in tokens.iter().enumerate() {
+        if token_index > 0 {
+            let whitespace_start = index;
+            while index < text.len() && text[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if whitespace_start == index {
+                return None;
+            }
+        }
+
+        for expected in token {
+            if index >= text.len() || text[index].to_ascii_lowercase() != *expected {
+                return None;
+            }
+            index += 1;
+        }
+    }
+
+    if requires_boundary(text.get(index.saturating_sub(1)).copied())
+        && is_boundary_char(text.get(index).copied())
+    {
+        return None;
+    }
+
+    Some(index)
+}
+
+fn requires_boundary(byte: Option<u8>) -> bool {
+    byte.is_some_and(is_boundary_byte)
+}
+
+fn is_boundary_char(byte: Option<u8>) -> bool {
+    byte.is_some_and(is_boundary_byte)
+}
+
+fn is_boundary_byte(value: u8) -> bool {
+    value.is_ascii_alphanumeric() || value == b'_'
+}
+
+/// Clean JSON schema by removing unsupported formats
+fn clean_schema(schema: Value) -> Value {
+    match schema {
+        Value::Object(mut obj) => {
+            obj.retain(|_, value| !value.is_null());
+
+            if obj.get("format").and_then(|v| v.as_str()) == Some("uri") {
+                obj.remove("format");
+            }
+
+            if let Some(properties) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+                for (_, value) in properties.iter_mut() {
+                    *value = clean_schema(value.clone());
+                }
+            }
+
+            for key in [
+                "items",
+                "additionalProperties",
+                "contains",
+                "not",
+                "if",
+                "then",
+                "else",
+            ] {
+                if let Some(value) = obj.get_mut(key) {
+                    *value = clean_schema(value.clone());
+                }
+            }
+
+            for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+                if let Some(values) = obj.get_mut(key).and_then(|v| v.as_array_mut()) {
+                    for value in values.iter_mut() {
+                        *value = clean_schema(value.clone());
+                    }
+                }
+            }
+
+            if obj.get("type").and_then(|v| v.as_str()) == Some("object")
+                && !obj.contains_key("required")
+            {
+                obj.insert("required".to_string(), Value::Array(Vec::new()));
+            }
+
+            if let Some(required) = obj.get_mut("required") {
+                if !required.is_array() {
+                    *required = Value::Array(Vec::new());
+                }
+            }
+
+            Value::Object(obj)
+        }
+        Value::Array(values) => Value::Array(values.into_iter().map(clean_schema).collect()),
+        other => other,
+    }
 }
 
 /// Transform OpenAI response to Anthropic format
@@ -295,8 +449,10 @@ pub fn map_stop_reason(finish_reason: Option<&str>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::openai_to_anthropic;
-    use crate::models::openai;
+    use super::{clean_schema, openai_to_anthropic, remove_ignored_term, sanitize_system_prompt};
+    use crate::config::Config;
+    use crate::models::{anthropic, openai};
+    use serde_json::json;
 
     #[test]
     fn openai_response_allows_missing_metadata_fields() {
@@ -358,5 +514,112 @@ mod tests {
 
         assert_eq!(anthropic.id, "chatcmpl-abc123");
         assert_eq!(anthropic.model, "gpt-4o");
+    }
+
+    #[test]
+    fn clean_schema_adds_empty_required_to_object_schemas() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "format": "uri"
+                }
+            }
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert_eq!(cleaned["required"], json!([]));
+        assert!(cleaned["properties"]["prompt"].get("format").is_none());
+    }
+
+    #[test]
+    fn clean_schema_normalizes_non_array_required() {
+        let schema = json!({
+            "type": "object",
+            "required": null
+        });
+
+        let cleaned = clean_schema(schema);
+
+        assert_eq!(cleaned["required"], json!([]));
+    }
+
+    #[test]
+    fn remove_ignored_term_matches_rm_rf_case_insensitively_with_flexible_whitespace() {
+        let sanitized =
+            remove_ignored_term("Avoid destructive operations such as RM\t-rF.", "rm -rf");
+
+        assert_eq!(sanitized, "Avoid destructive operations such as .");
+    }
+
+    #[test]
+    fn remove_ignored_term_respects_word_boundaries() {
+        let sanitized = remove_ignored_term("farm -rf should not match rm -rf", "rm -rf");
+
+        assert_eq!(sanitized, "farm -rf should not match ");
+    }
+
+    #[test]
+    fn sanitize_system_prompt_removes_configured_terms() {
+        let config = Config {
+            port: 3000,
+            base_url: "https://example.com".to_string(),
+            api_key: None,
+            system_prompt_ignore_terms: vec!["rm -rf".to_string()],
+            reasoning_model: None,
+            completion_model: None,
+            debug: false,
+            verbose: false,
+        };
+
+        let sanitized =
+            sanitize_system_prompt("Examples of risky actions: rm -rf.".to_string(), &config);
+
+        assert_eq!(sanitized, "Examples of risky actions: .");
+    }
+
+    #[test]
+    fn anthropic_to_openai_sanitizes_configured_system_prompt_terms() {
+        let req = anthropic::AnthropicRequest {
+            model: "openai/gpt-4.1-mini".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("pong".to_string()),
+            }],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Single(
+                "Examples of risky actions: rm -rf.".to_string(),
+            )),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: Some(true),
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let config = Config {
+            port: 3000,
+            base_url: "https://example.com".to_string(),
+            api_key: None,
+            system_prompt_ignore_terms: vec!["rm -rf".to_string()],
+            reasoning_model: None,
+            completion_model: None,
+            debug: false,
+            verbose: false,
+        };
+
+        let openai = super::anthropic_to_openai(req, &config).unwrap();
+
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "Examples of risky actions: .");
+            }
+            _ => panic!("expected sanitized system prompt"),
+        }
     }
 }

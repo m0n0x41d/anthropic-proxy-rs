@@ -81,6 +81,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     if let Some(port) = cli.port {
         config.port = port;
     }
+    if !cli.system_prompt_ignore.is_empty() {
+        config.system_prompt_ignore_terms.extend(
+            cli.system_prompt_ignore
+                .into_iter()
+                .map(|term| term.trim().to_string())
+                .filter(|term| !term.is_empty()),
+        );
+        Config::dedupe_ignore_terms(&mut config.system_prompt_ignore_terms);
+    }
 
     let log_level = if config.verbose {
         tracing::Level::TRACE
@@ -115,6 +124,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         tracing::info!("API Key: configured");
     } else {
         tracing::info!("API Key: not set (using unauthenticated endpoint)");
+    }
+    if !config.system_prompt_ignore_terms.is_empty() {
+        tracing::info!(
+            "System prompt ignore terms: {}",
+            config.system_prompt_ignore_terms.join("; ")
+        );
     }
 
     let client = Client::builder()
