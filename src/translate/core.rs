@@ -46,9 +46,20 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                         content,
                         ..
                     } => {
+                        let text = match content {
+                            anthropic::ToolResultContent::Text(s) => s,
+                            anthropic::ToolResultContent::Blocks(blocks) => blocks
+                                .into_iter()
+                                .filter_map(|b| match b {
+                                    anthropic::ContentBlock::Text { text, .. } => Some(text),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        };
                         result.push(openai::Message {
                             role: "tool".to_string(),
-                            content: Some(openai::MessageContent::Text(content)),
+                            content: Some(openai::MessageContent::Text(text)),
                             tool_calls: None,
                             tool_call_id: Some(tool_use_id),
                             name: None,
