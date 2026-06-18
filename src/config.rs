@@ -1,6 +1,27 @@
 use anyhow::{bail, Result};
+use regex::Regex;
 use reqwest::Url;
 use std::{collections::BTreeMap, env, path::PathBuf};
+
+/// A single system prompt ignore rule, compiled from its raw configuration string.
+///
+/// A raw term wrapped in slashes (`/pattern/`) is treated as a regular expression;
+/// anything else is matched literally (case-insensitive, whitespace-flexible).
+#[derive(Debug, Clone)]
+pub enum IgnoreTerm {
+    Literal(String),
+    Regex(Regex),
+}
+
+impl IgnoreTerm {
+    /// Human-readable form used for logging which terms were applied.
+    pub fn describe(&self) -> String {
+        match self {
+            IgnoreTerm::Literal(term) => term.clone(),
+            IgnoreTerm::Regex(re) => format!("/{}/", re.as_str()),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,6 +32,7 @@ pub struct Config {
     pub passthrough_api_key: bool,
     pub model_map: BTreeMap<String, String>,
     pub system_prompt_ignore_terms: Vec<String>,
+    pub system_prompt_ignore_matchers: Vec<IgnoreTerm>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub debug: bool,
@@ -27,6 +49,7 @@ impl Default for Config {
             passthrough_api_key: false,
             model_map: BTreeMap::new(),
             system_prompt_ignore_terms: Vec::new(),
+            system_prompt_ignore_matchers: Vec::new(),
             reasoning_model: None,
             completion_model: None,
             debug: false,
@@ -120,6 +143,7 @@ impl Config {
             .map(|value| Self::parse_system_prompt_ignore_terms(&value))
             .unwrap_or_default();
         Self::dedupe_ignore_terms(&mut system_prompt_ignore_terms);
+        let system_prompt_ignore_matchers = Self::compile_ignore_terms(&system_prompt_ignore_terms);
 
         let reasoning_model = env::var("REASONING_MODEL").ok();
         let completion_model = env::var("COMPLETION_MODEL").ok();
@@ -153,6 +177,7 @@ impl Config {
             passthrough_api_key,
             model_map,
             system_prompt_ignore_terms,
+            system_prompt_ignore_matchers,
             reasoning_model,
             completion_model,
             debug,
@@ -296,6 +321,40 @@ impl Config {
             .filter(|term| !term.is_empty())
             .map(ToOwned::to_owned)
             .collect()
+    }
+
+    /// Compile raw ignore terms into matchers.
+    ///
+    /// A term wrapped in slashes (`/pattern/`) is compiled as a regular expression.
+    /// Use the inline `(?i)` flag for case-insensitive matching. Any other term is
+    /// matched literally. Invalid regexes are reported and skipped so a single bad
+    /// pattern does not take down the proxy.
+    pub fn compile_ignore_terms(terms: &[String]) -> Vec<IgnoreTerm> {
+        terms
+            .iter()
+            .filter_map(|term| Self::compile_ignore_term(term))
+            .collect()
+    }
+
+    fn compile_ignore_term(term: &str) -> Option<IgnoreTerm> {
+        if let Some(pattern) = term
+            .strip_prefix('/')
+            .and_then(|rest| rest.strip_suffix('/'))
+            .filter(|pattern| !pattern.is_empty())
+        {
+            return match Regex::new(pattern) {
+                Ok(regex) => Some(IgnoreTerm::Regex(regex)),
+                Err(err) => {
+                    eprintln!(
+                        "⚠️  WARNING: Ignoring invalid system prompt regex '{}': {}",
+                        term, err
+                    );
+                    None
+                }
+            };
+        }
+
+        Some(IgnoreTerm::Literal(term.to_string()))
     }
 
     pub fn dedupe_ignore_terms(terms: &mut Vec<String>) {
@@ -505,6 +564,33 @@ mod tests {
             terms,
             vec!["rm -rf".to_string(), "git reset --hard".to_string()]
         );
+    }
+
+    #[test]
+    fn compile_ignore_terms_distinguishes_literals_and_regexes() {
+        let matchers =
+            Config::compile_ignore_terms(&["rm -rf".to_string(), r"/[A-Z]{3}-\d{5}/".to_string()]);
+
+        assert_eq!(matchers.len(), 2);
+        assert!(matches!(&matchers[0], super::IgnoreTerm::Literal(term) if term == "rm -rf"));
+        assert!(matches!(&matchers[1], super::IgnoreTerm::Regex(_)));
+    }
+
+    #[test]
+    fn compile_ignore_terms_skips_invalid_regex() {
+        let matchers =
+            Config::compile_ignore_terms(&["keep".to_string(), "/(unclosed/".to_string()]);
+
+        assert_eq!(matchers.len(), 1);
+        assert!(matches!(&matchers[0], super::IgnoreTerm::Literal(term) if term == "keep"));
+    }
+
+    #[test]
+    fn compile_ignore_terms_treats_empty_slashes_as_literal() {
+        let matchers = Config::compile_ignore_terms(&["//".to_string()]);
+
+        assert_eq!(matchers.len(), 1);
+        assert!(matches!(&matchers[0], super::IgnoreTerm::Literal(term) if term == "//"));
     }
 
     #[test]

@@ -99,6 +99,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 .filter(|term| !term.is_empty()),
         );
         Config::dedupe_ignore_terms(&mut config.system_prompt_ignore_terms);
+        config.system_prompt_ignore_matchers =
+            Config::compile_ignore_terms(&config.system_prompt_ignore_terms);
     }
 
     let log_level = if config.verbose {
@@ -138,11 +140,14 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     } else {
         tracing::info!("API Key: not set (using unauthenticated endpoint)");
     }
-    if !config.system_prompt_ignore_terms.is_empty() {
-        tracing::info!(
-            "System prompt ignore terms: {}",
-            config.system_prompt_ignore_terms.join("; ")
-        );
+    if !config.system_prompt_ignore_matchers.is_empty() {
+        let terms = config
+            .system_prompt_ignore_matchers
+            .iter()
+            .map(|term| term.describe())
+            .collect::<Vec<_>>()
+            .join("; ");
+        tracing::info!("System prompt ignore terms: {}", terms);
     }
     if !config.model_map.is_empty() {
         let entries = config
