@@ -93,6 +93,8 @@ Configuration can be set via environment variables or `.env` file:
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `REASONING_MODEL` | No | (uses request model) | Model to use when extended thinking is enabled** |
 | `COMPLETION_MODEL` | No | (uses request model) | Model to use for standard requests (no thinking)** |
+| `ANTHROPIC_PROXY_REQUEST_TIMEOUT` | No | `300` | Total timeout (seconds) for **non-streaming** upstream requests. Streaming requests have no total timeout (see `ANTHROPIC_PROXY_STREAM_IDLE_TIMEOUT`). |
+| `ANTHROPIC_PROXY_STREAM_IDLE_TIMEOUT` | No | `300` | Read/idle timeout (seconds) for upstream connections. Resets on every received chunk, so it only fires when the upstream goes silent — it does **not** cap the total duration of a long, actively-streaming response. Raise it if your upstream has long quiet gaps during extended thinking. |
 | `DEBUG` | No | `false` | Enable debug logging (`1` or `true`) |
 | `VERBOSE` | No | `false` | Enable verbose logging (`1` or `true`) |
 
@@ -301,6 +303,9 @@ The following Anthropic API features are **not supported** currently (Claude Cod
 
 **Gateway/WAF blocks Claude Code system prompts with `403`**
 → Use `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` or `--system-prompt-ignore` to remove offending terms before forwarding upstream
+
+**Error: `Stream error: error decoding response body` after long thinking/generation**
+→ The upstream connection stalled or was capped mid-stream. Streaming requests have no total timeout, but a read/idle timeout still applies. If your upstream goes quiet for long stretches during extended thinking, raise `ANTHROPIC_PROXY_STREAM_IDLE_TIMEOUT` (seconds).
 
 ## License
 

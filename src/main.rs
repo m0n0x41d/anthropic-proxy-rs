@@ -127,6 +127,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         "Resolved chat completions URLs: {}",
         config.chat_completions_urls().join("; ")
     );
+    tracing::info!(
+        "Timeouts: connect=10s, read/idle={}s, non-streaming total={}s",
+        config.stream_idle_timeout_secs,
+        config.request_timeout_secs
+    );
     if let Some(ref model) = config.reasoning_model {
         tracing::info!("Reasoning Model Override: {}", model);
     }
@@ -161,9 +166,19 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let metrics_handle = metrics::install();
 
+    // NB: no total request timeout here. A total timeout caps the *entire*
+    // streamed response, so a long-but-active turn (e.g. extended thinking that
+    // runs for several minutes) would be aborted mid-stream and surface to the
+    // client as "Stream error: error decoding response body". Instead we rely on
+    // a read/idle timeout, which resets on every received chunk and only fires
+    // when the upstream actually stalls. Non-streaming requests get an explicit
+    // total timeout applied per-request in the proxy handler.
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(
+            config.stream_idle_timeout_secs,
+        ))
+        .tcp_keepalive(std::time::Duration::from_secs(60))
         .pool_max_idle_per_host(10)
         .build()?;
 

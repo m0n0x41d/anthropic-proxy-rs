@@ -35,6 +35,12 @@ pub struct Config {
     pub system_prompt_ignore_matchers: Vec<IgnoreTerm>,
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
+    /// Total timeout (seconds) for non-streaming upstream requests.
+    pub request_timeout_secs: u64,
+    /// Read/idle timeout (seconds) for upstream connections. Resets on every
+    /// successful read, so it bounds stalled connections without capping the
+    /// total duration of a long but actively-streaming response.
+    pub stream_idle_timeout_secs: u64,
     pub debug: bool,
     pub verbose: bool,
 }
@@ -52,6 +58,8 @@ impl Default for Config {
             system_prompt_ignore_matchers: Vec::new(),
             reasoning_model: None,
             completion_model: None,
+            request_timeout_secs: 300,
+            stream_idle_timeout_secs: 300,
             debug: false,
             verbose: false,
         }
@@ -148,6 +156,11 @@ impl Config {
         let reasoning_model = env::var("REASONING_MODEL").ok();
         let completion_model = env::var("COMPLETION_MODEL").ok();
 
+        let request_timeout_secs =
+            Self::parse_timeout_secs(env::var("ANTHROPIC_PROXY_REQUEST_TIMEOUT").ok(), 300);
+        let stream_idle_timeout_secs =
+            Self::parse_timeout_secs(env::var("ANTHROPIC_PROXY_STREAM_IDLE_TIMEOUT").ok(), 300);
+
         let debug = env::var("DEBUG")
             .map(|v| v == "1" || v.to_lowercase() == "true")
             .unwrap_or(false);
@@ -180,9 +193,19 @@ impl Config {
             system_prompt_ignore_matchers,
             reasoning_model,
             completion_model,
+            request_timeout_secs,
+            stream_idle_timeout_secs,
             debug,
             verbose,
         })
+    }
+
+    /// Parse a positive timeout value (in seconds) from an env var string,
+    /// falling back to `default` for missing, non-numeric, or zero values.
+    fn parse_timeout_secs(raw: Option<String>, default: u64) -> u64 {
+        raw.and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .unwrap_or(default)
     }
 
     pub fn chat_completions_urls(&self) -> Vec<String> {
@@ -687,6 +710,36 @@ mod tests {
         };
         assert!(config.passthrough_api_key);
         assert!(config.api_key.is_none());
+    }
+
+    #[test]
+    fn timeout_defaults_are_300_seconds() {
+        let config = Config::default();
+        assert_eq!(config.request_timeout_secs, 300);
+        assert_eq!(config.stream_idle_timeout_secs, 300);
+    }
+
+    #[test]
+    fn parse_timeout_secs_falls_back_for_invalid_values() {
+        assert_eq!(Config::parse_timeout_secs(None, 300), 300);
+        assert_eq!(Config::parse_timeout_secs(Some("0".to_string()), 300), 300);
+        assert_eq!(
+            Config::parse_timeout_secs(Some("abc".to_string()), 300),
+            300
+        );
+        assert_eq!(Config::parse_timeout_secs(Some("".to_string()), 300), 300);
+    }
+
+    #[test]
+    fn parse_timeout_secs_accepts_positive_values() {
+        assert_eq!(
+            Config::parse_timeout_secs(Some("600".to_string()), 300),
+            600
+        );
+        assert_eq!(
+            Config::parse_timeout_secs(Some("  900 ".to_string()), 300),
+            900
+        );
     }
 
     #[test]

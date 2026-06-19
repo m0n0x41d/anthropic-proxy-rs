@@ -158,7 +158,7 @@ async fn handle_non_streaming(
         let mut req_builder = client
             .post(url)
             .json(&openai_req)
-            .timeout(Duration::from_secs(300));
+            .timeout(Duration::from_secs(config.request_timeout_secs));
 
         if let Some(ref key) = api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
@@ -249,10 +249,12 @@ async fn handle_streaming(
             openai_req.model
         );
 
-        let mut req_builder = client
-            .post(url)
-            .json(&openai_req)
-            .timeout(Duration::from_secs(300));
+        // No total timeout for streaming: a long, actively-streaming response
+        // (e.g. extended thinking that runs for minutes) is legitimate. A total
+        // timeout would abort it mid-stream and surface as a decode error to the
+        // client. The client's read/idle timeout bounds genuinely stalled
+        // connections instead.
+        let mut req_builder = client.post(url).json(&openai_req);
 
         if let Some(ref key) = api_key {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
