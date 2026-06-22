@@ -73,6 +73,14 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                             reasoning_parts.push(thinking);
                         }
                     }
+                    anthropic::ContentBlock::Unknown => {
+                        // Unrecognized block type (e.g. a newer Anthropic/Claude Code
+                        // block); it has no OpenAI equivalent, so skip it instead of
+                        // failing the whole request.
+                        tracing::debug!(
+                            "Skipping unsupported Anthropic content block during translation"
+                        );
+                    }
                 }
             }
 
@@ -332,6 +340,53 @@ mod tests {
             translated[0].reasoning_content.as_deref(),
             Some("hidden chain")
         );
+    }
+
+    #[test]
+    fn unknown_block_type_deserializes_instead_of_failing() {
+        // Regression: a content array containing a block type the proxy does not
+        // model (as emitted by Claude Code's tool-search / deferred-tools flow)
+        // used to fail the whole request with "data did not match any variant of
+        // untagged enum MessageContent". It must now parse into Unknown.
+        let msg: anthropic::Message = serde_json::from_value(json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "before" },
+                { "type": "tool_search_result", "id": "ts_1", "results": ["x"] },
+                { "type": "text", "text": "after" }
+            ]
+        }))
+        .expect("unknown block types must not break deserialization");
+
+        match &msg.content {
+            anthropic::MessageContent::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 3);
+                assert!(matches!(blocks[1], anthropic::ContentBlock::Unknown));
+            }
+            other => panic!("expected blocks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_block_is_skipped_during_translation() {
+        let msg = anthropic::Message {
+            role: "user".to_string(),
+            content: anthropic::MessageContent::Blocks(vec![
+                anthropic::ContentBlock::Unknown,
+                anthropic::ContentBlock::Text {
+                    text: "kept".to_string(),
+                    cache_control: None,
+                },
+            ]),
+        };
+
+        let translated = translate_message(msg).unwrap();
+
+        assert_eq!(translated.len(), 1);
+        assert!(matches!(
+            translated[0].content,
+            Some(openai::MessageContent::Text(ref t)) if t == "kept"
+        ));
     }
 
     #[test]

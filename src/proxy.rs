@@ -19,8 +19,28 @@ pub async fn proxy_handler(
     Extension(config): Extension<Arc<Config>>,
     Extension(client): Extension<Client>,
     headers: HeaderMap,
-    Json(req): Json<anthropic::AnthropicRequest>,
+    body: Bytes,
 ) -> ProxyResult<Response> {
+    // Deserialize manually instead of via the `Json` extractor so that a parse
+    // failure logs the raw body (the extractor discards it, leaving only an opaque
+    // 422). This is what surfaces unmodeled content blocks, e.g. new block types
+    // sent by Claude Code's tool-search / deferred-tools feature.
+    let req: anthropic::AnthropicRequest = serde_json::from_slice(&body).map_err(|err| {
+        const MAX_LOG: usize = 20_000;
+        let raw = String::from_utf8_lossy(&body);
+        let (preview, truncated) = if raw.len() > MAX_LOG {
+            (&raw[..MAX_LOG], true)
+        } else {
+            (raw.as_ref(), false)
+        };
+        tracing::error!(
+            "Failed to deserialize Anthropic request ({} bytes): {err}. Raw body{}: {preview}",
+            body.len(),
+            if truncated { " (truncated)" } else { "" },
+        );
+        ProxyError::Serialization(err)
+    })?;
+
     let is_streaming = req.stream.unwrap_or(false);
     let start = Instant::now();
 
