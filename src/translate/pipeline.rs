@@ -1,3 +1,4 @@
+use crate::config::IgnoreTerm;
 use crate::error::{ProxyError, ProxyResult};
 use crate::models::{anthropic, openai};
 use crate::translate::core;
@@ -8,7 +9,7 @@ pub struct TranslationPolicy {
     pub reasoning_model: Option<String>,
     pub completion_model: Option<String>,
     pub model_map: BTreeMap<String, String>,
-    pub ignore_terms: Vec<String>,
+    pub ignore_terms: Vec<IgnoreTerm>,
 }
 
 pub fn translate_request(
@@ -20,35 +21,31 @@ pub fn translate_request(
     let mut openai_messages = Vec::new();
 
     if let Some(system) = req.system {
-        match system {
-            anthropic::SystemPrompt::Single(text) => {
-                openai_messages.push(openai::Message {
-                    role: "system".to_string(),
-                    content: Some(openai::MessageContent::Text(sanitize_prompt(
-                        text,
-                        &policy.ignore_terms,
-                    ))),
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
-            }
+        let system_texts = match system {
+            anthropic::SystemPrompt::Single(text) => vec![text],
             anthropic::SystemPrompt::Multiple(messages) => {
-                for msg in messages {
-                    openai_messages.push(openai::Message {
-                        role: "system".to_string(),
-                        content: Some(openai::MessageContent::Text(sanitize_prompt(
-                            msg.text,
-                            &policy.ignore_terms,
-                        ))),
-                        reasoning_content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        name: None,
-                    });
-                }
+                messages.into_iter().map(|msg| msg.text).collect()
             }
+        };
+
+        for text in system_texts {
+            let sanitized = sanitize_prompt(text, &policy.ignore_terms);
+
+            // Drop system blocks that are emptied out by term removal — forwarding an
+            // empty system message is pointless and some upstreams reject it.
+            if sanitized.trim().is_empty() {
+                tracing::debug!("Dropping system prompt block left empty after term removal");
+                continue;
+            }
+
+            openai_messages.push(openai::Message {
+                role: "system".to_string(),
+                content: Some(openai::MessageContent::Text(sanitized)),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
         }
     }
 
@@ -194,15 +191,18 @@ fn select_model(req: &anthropic::AnthropicRequest, policy: &TranslationPolicy) -
     policy.model_map.get(&model).cloned().unwrap_or(model)
 }
 
-fn sanitize_prompt(text: String, terms: &[String]) -> String {
+fn sanitize_prompt(text: String, terms: &[IgnoreTerm]) -> String {
     let mut sanitized = text;
     let mut removed = Vec::new();
 
     for term in terms {
-        let next = core::remove_term(&sanitized, term);
+        let next = match term {
+            IgnoreTerm::Literal(literal) => core::remove_term(&sanitized, literal),
+            IgnoreTerm::Regex(regex) => regex.replace_all(&sanitized, "").into_owned(),
+        };
         if next != sanitized {
             sanitized = next;
-            removed.push(term.clone());
+            removed.push(term.describe());
         }
     }
 
@@ -227,7 +227,7 @@ mod tests {
             reasoning_model: config.reasoning_model.clone(),
             completion_model: config.completion_model.clone(),
             model_map: config.model_map.clone(),
-            ignore_terms: config.system_prompt_ignore_terms.clone(),
+            ignore_terms: config.system_prompt_ignore_matchers.clone(),
         }
     }
 
@@ -289,7 +289,7 @@ mod tests {
         };
 
         let policy = TranslationPolicy {
-            ignore_terms: vec!["rm -rf".to_string()],
+            ignore_terms: vec![IgnoreTerm::Literal("rm -rf".to_string())],
             ..default_policy()
         };
 
@@ -300,6 +300,97 @@ mod tests {
                 assert_eq!(text, "Examples of risky actions: .");
             }
             _ => panic!("expected sanitized system prompt"),
+        }
+    }
+
+    #[test]
+    fn sanitizes_system_prompt_with_regex_term() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("pong".to_string()),
+            }],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Single(
+                "Session id ABC-12345 then DEF-67890.".to_string(),
+            )),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: Some(true),
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let terms = Config::compile_ignore_terms(&[r"/[A-Z]{3}-\d{5}/".to_string()]);
+        let policy = TranslationPolicy {
+            ignore_terms: terms,
+            ..default_policy()
+        };
+
+        let openai = translate_request(req, &policy).unwrap();
+
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "Session id  then .");
+            }
+            _ => panic!("expected sanitized system prompt"),
+        }
+    }
+
+    #[test]
+    fn drops_system_block_emptied_by_term_removal() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![anthropic::Message {
+                role: "user".to_string(),
+                content: anthropic::MessageContent::Text("hi".to_string()),
+            }],
+            max_tokens: 64,
+            system: Some(anthropic::SystemPrompt::Multiple(vec![
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "  sk-abc12345  ".to_string(),
+                    cache_control: None,
+                },
+                anthropic::SystemMessage {
+                    message_type: "text".to_string(),
+                    text: "You are helpful.".to_string(),
+                    cache_control: None,
+                },
+            ])),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let terms = Config::compile_ignore_terms(&[r"/sk-[a-z0-9]{8}/".to_string()]);
+        let policy = TranslationPolicy {
+            ignore_terms: terms,
+            ..default_policy()
+        };
+
+        let openai = translate_request(req, &policy).unwrap();
+
+        let system_msgs: Vec<_> = openai
+            .messages
+            .iter()
+            .filter(|m| m.role == "system")
+            .collect();
+        assert_eq!(system_msgs.len(), 1);
+        match &system_msgs[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "You are helpful.");
+            }
+            _ => panic!("expected surviving system prompt"),
         }
     }
 

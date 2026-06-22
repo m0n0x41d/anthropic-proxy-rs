@@ -72,7 +72,7 @@ anthropic-proxy --help
 | `--verbose` | `-v` | Enable verbose logging (logs full request/response bodies) |
 | `--port <PORT>` | `-p` | Port to listen on (overrides PORT env var) |
 | `--bind <ADDR>` | | Address to bind the listener to (overrides `ANTHROPIC_PROXY_BIND`, default `0.0.0.0`) |
-| `--system-prompt-ignore <TEXT>` | | Remove one or more system prompt terms before forwarding upstream (repeat or separate with `;`) |
+| `--system-prompt-ignore <TEXT>` | | Remove one or more system prompt terms before forwarding upstream (repeat or separate with `;`; wrap in `/.../` for a regex) |
 | `--daemon` | | Run as background daemon |
 | `--pid-file <FILE>` | | PID file path (default: `/tmp/anthropic-proxy.pid`) |
 | `--help` | `-h` | Print help information |
@@ -89,7 +89,7 @@ Configuration can be set via environment variables or `.env` file:
 | `UPSTREAM_API_KEY_PASSTHROUGH` | No | `false` | Extract API key from incoming `x-api-key` header per request (`true`/`false`) |
 | `PORT` | No | `3000` | Server port |
 | `ANTHROPIC_PROXY_BIND` | No | `0.0.0.0` | Listener bind address. Set to `127.0.0.1` to restrict access to localhost (recommended on shared networks). When bound to `0.0.0.0`, a warning is logged. |
-| `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | - | System prompt terms to remove before forwarding upstream (`;` or newline separated) |
+| `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS` | No | - | System prompt terms to remove before forwarding upstream (`;` or newline separated; wrap in `/.../` for a regex) |
 | `ANTHROPIC_PROXY_MODEL_MAP` | No | - | Exact model remapping before the upstream call (`source=target;other=target`) |
 | `REASONING_MODEL` | No | (uses request model) | Model to use when extended thinking is enabled** |
 | `COMPLETION_MODEL` | No | (uses request model) | Model to use for standard requests (no thinking)** |
@@ -108,6 +108,9 @@ System prompt sanitization:
 - The proxy can remove configured terms from upstream `system` prompts before forwarding.
 - Set terms with `ANTHROPIC_PROXY_SYSTEM_PROMPT_IGNORE_TERMS='rm -rf;git reset --hard'`
 - Or repeat `--system-prompt-ignore`, for example `--system-prompt-ignore 'rm -rf' --system-prompt-ignore 'git reset --hard'`
+- Plain terms match literally (case-insensitive, whitespace-flexible, on word boundaries).
+- A term wrapped in slashes is treated as a regular expression, for example `--system-prompt-ignore '/sk-[A-Za-z0-9]{20,}/'` to strip API-key-like strings. Add the inline `(?i)` flag for case-insensitive matching, e.g. `/(?i)do not refuse/`. Every match is removed.
+- Regex patterns cannot contain the `;` separator literally (it splits terms); pass such a pattern via a dedicated `--system-prompt-ignore` flag or escape it as `\x3b`. Invalid patterns are reported on startup and skipped.
 
 Model mapping:
 - `ANTHROPIC_PROXY_MODEL_MAP='claude-opus-4-6=openai/gpt-4.1;claude-haiku-4-5=openai/gpt-4.1-mini'`
