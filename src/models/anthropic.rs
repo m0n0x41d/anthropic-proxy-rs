@@ -86,6 +86,13 @@ pub enum ContentBlock {
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// Fallback for any block type this proxy does not explicitly model — e.g. new
+    /// block types introduced by the Anthropic API or by Claude Code features such
+    /// as tool search / deferred tools. Without this catch-all, a single unrecognized
+    /// block makes the whole request fail to deserialize with an opaque
+    /// "data did not match any variant of untagged enum MessageContent" error.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Content inside a tool_result block: either a plain string or nested content blocks
