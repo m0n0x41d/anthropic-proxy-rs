@@ -1,0 +1,19 @@
+services:
+  anthropic-proxy-rs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anthropic-proxy-rs
+    ports:
+      - "8082:3000"
+    environment:
+      UPSTREAM_BASE_URL: ${UPSTREAM_BASE_URL}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY}
+      REASONING_MODEL: ${ANTHROPIC_DEFAULT_OPUS_MODEL}
+      COMPLETION_MODEL: ${ANTHROPIC_DEFAULT_HAIKU_MODEL}
+      ANTHROPIC_PROXY_MODEL_MAP: "claude-sonnet-4=${ANTHROPIC_DEFAULT_SONNET_MODEL};claude-opus-4=${ANTHROPIC_DEFAULT_OPUS_MODEL};claude-haiku-4=${ANTHROPIC_DEFAULT_HAIKU_MODEL}"
+      DEBUG: false
+      VERBOSE: true
+      RUST_LOG: info
+      UPSTREAM_API_KEY_PASSTHROUGH: false
+    restart: unless-stopped

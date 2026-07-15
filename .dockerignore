@@ -1,7 +1,4 @@
 target/
 .git/
-.github/
-.haft/
-specs/
-*.md
-LICENSE
+.env
+docker-compose*.yaml

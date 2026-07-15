@@ -1,6 +1,6 @@
 [package]
 name = "anthropic-proxy"
-version = "1.2.0"
+version = "1.2.2"
 edition = "2021"
 authors = ["m0n0x41d <zakutnii.ivan@gmail.com>"]
 description = "High-performance Anthropic API proxy to OpenAI-compatible endpoints"
