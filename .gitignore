@@ -22,3 +22,6 @@ target
 
 .env
 .task/*
+
+# SBOM
+*.cyclonedx.json

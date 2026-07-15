@@ -2,3 +2,4 @@ target/
 .git/
 .env
 docker-compose*.yaml
+*.cyclonedx.json
