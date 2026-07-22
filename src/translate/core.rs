@@ -73,6 +73,11 @@ pub fn translate_message(msg: anthropic::Message) -> ProxyResult<Vec<openai::Mes
                             reasoning_parts.push(thinking);
                         }
                     }
+                    anthropic::ContentBlock::Unknown => {
+                        tracing::warn!(
+                            "dropping unsupported content block before forwarding upstream"
+                        );
+                    }
                 }
             }
 
