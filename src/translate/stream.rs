@@ -24,6 +24,22 @@ impl BlockState {
     }
 }
 
+/// Tracks the OpenAI streaming tool currently being assembled.
+///
+/// GLM (and some other OpenAI-compatible upstreams) re-send the tool `id`
+/// on every arguments-delta chunk. Keying on the upstream `tool_call.index`
+/// lets us emit deltas into the already-open content block instead of
+/// reopening it on every chunk — which fragmented one tool into many
+/// half-empty `tool_use` blocks and left the client with only the opening
+/// `{` as input.
+#[derive(Debug)]
+struct ToolBlock {
+    /// Upstream `tool_call.index` this block corresponds to.
+    call_index: usize,
+    /// Anthropic content block index we opened for it.
+    content_index: usize,
+}
+
 #[derive(Debug)]
 pub struct StreamState {
     message_id: Option<String>,
@@ -32,6 +48,8 @@ pub struct StreamState {
     block: BlockState,
     next_index: usize,
     message_started: bool,
+    reasoning_buf: String,
+    current_tool: Option<ToolBlock>,
 }
 
 pub fn initial_state(fallback_model: String) -> StreamState {
@@ -42,6 +60,8 @@ pub fn initial_state(fallback_model: String) -> StreamState {
         block: BlockState::Idle,
         next_index: 0,
         message_started: false,
+        reasoning_buf: String::new(),
+        current_tool: None,
     }
 }
 
@@ -109,8 +129,11 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
     events
 }
 
-pub fn translate_done(_state: &mut StreamState) -> Vec<StreamEvent> {
-    vec![StreamEvent::MessageStop]
+pub fn translate_done(state: &mut StreamState) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    flush_reasoning(&mut events, state);
+    events.push(StreamEvent::MessageStop);
+    events
 }
 
 pub fn translate_error(message: String) -> Vec<StreamEvent> {
@@ -127,29 +150,39 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
     }
+    // A closed block can no longer receive deltas; drop tool tracking so the
+    // next tool_call chunk (even one reusing the same upstream index) reopens.
+    state.current_tool = None;
 }
 
-fn emit_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
-    if !matches!(state.block, BlockState::Thinking { .. }) {
-        close_current_block(events, state);
-        let index = state.next_index;
-        events.push(StreamEvent::ContentBlockStart {
-            index,
-            content_block: ContentBlockStart::Thinking {
-                thinking: String::new(),
-            },
-        });
-        state.block = BlockState::Thinking { index };
-    }
+fn emit_reasoning(_events: &mut Vec<StreamEvent>, state: &mut StreamState, reasoning: &str) {
+    // GLM 边想边说:reasoning 与 content 在同一 chunk 交错出现。
+    // 若每个 reasoning 都即时开 Thinking block,会把正文拆成大量碎片 Text block(换行问题)。
+    // 这里改为累积 reasoning,在响应结束时统一 flush 成一个 Thinking block,
+    // 让正文保持单个连续 Text block(逐字流式 + 不换行)。
+    state.reasoning_buf.push_str(reasoning);
+}
 
-    if let BlockState::Thinking { index } = state.block {
-        events.push(StreamEvent::ContentBlockDelta {
-            index,
-            delta: Delta::ThinkingDelta {
-                thinking: reasoning.to_string(),
-            },
-        });
+/// 把累积的 reasoning 作为一个 Thinking block 输出(在正文 Text block 之后)。
+fn flush_reasoning(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
+    if state.reasoning_buf.is_empty() {
+        return;
     }
+    let index = state.next_index;
+    events.push(StreamEvent::ContentBlockStart {
+        index,
+        content_block: ContentBlockStart::Thinking {
+            thinking: String::new(),
+        },
+    });
+    events.push(StreamEvent::ContentBlockDelta {
+        index,
+        delta: Delta::ThinkingDelta {
+            thinking: std::mem::take(&mut state.reasoning_buf),
+        },
+    });
+    events.push(StreamEvent::ContentBlockStop { index });
+    state.next_index = index + 1;
 }
 
 fn emit_text(events: &mut Vec<StreamEvent>, state: &mut StreamState, content: &str) {
@@ -181,29 +214,58 @@ fn emit_tool_calls(
     tool_calls: &[openai::DeltaToolCall],
 ) {
     for tool_call in tool_calls {
-        if let Some(id) = &tool_call.id {
-            close_current_block(events, state);
-            let index = state.next_index;
+        let call_index = tool_call.index;
 
-            if let Some(function) = &tool_call.function {
-                if let Some(name) = &function.name {
-                    events.push(StreamEvent::ContentBlockStart {
-                        index,
-                        content_block: ContentBlockStart::ToolUse {
-                            id: id.clone(),
-                            name: name.clone(),
-                        },
-                    });
-                    state.block = BlockState::ToolUse { index };
-                }
-            }
+        // Open a new content block only when the upstream tool index changes.
+        // GLM re-sends `id` on every delta; keying on `index` keeps a single
+        // tool_use block instead of fragmenting it into one per chunk.
+        let is_new_tool = match &state.current_tool {
+            Some(tool) => tool.call_index != call_index,
+            None => true,
+        };
+
+        if is_new_tool {
+            close_current_block(events, state);
+
+            let content_index = state.next_index;
+            let id = tool_call.id.clone().unwrap_or_else(|| {
+                tracing::warn!(
+                    "tool_call at index {} arrived without an id; synthesizing one",
+                    call_index
+                );
+                format!("toolu_proxy_{}", content_index)
+            });
+            let name = tool_call
+                .function
+                .as_ref()
+                .and_then(|f| f.name.clone())
+                .unwrap_or_default();
+
+            events.push(StreamEvent::ContentBlockStart {
+                index: content_index,
+                content_block: ContentBlockStart::ToolUse { id, name },
+            });
+            state.block = BlockState::ToolUse {
+                index: content_index,
+            };
+            state.current_tool = Some(ToolBlock {
+                call_index,
+                content_index,
+            });
         }
 
-        if let Some(function) = &tool_call.function {
-            if let Some(args) = &function.arguments {
-                if let BlockState::ToolUse { index } = state.block {
+        // Route argument deltas via the tracked tool block rather than the
+        // singular `state.block`, so they land correctly even when `id` is
+        // absent (as on GLM's incremental argument chunks).
+        if let Some(args) = tool_call
+            .function
+            .as_ref()
+            .and_then(|f| f.arguments.as_ref())
+        {
+            if !args.is_empty() {
+                if let Some(tool) = &state.current_tool {
                     events.push(StreamEvent::ContentBlockDelta {
-                        index,
+                        index: tool.content_index,
                         delta: Delta::InputJsonDelta {
                             partial_json: args.clone(),
                         },
@@ -221,6 +283,7 @@ fn emit_finish(
     usage: Option<&openai::Usage>,
 ) {
     close_current_block(events, state);
+    flush_reasoning(events, state);
 
     let stop_reason = core::map_stop_reason(Some(finish_reason));
 
@@ -347,26 +410,31 @@ mod tests {
         let mut state = initial_state("fallback".into());
 
         let e1 = translate_chunk(&mut state, &reasoning_chunk("1", "gpt-4o", "Let me think"));
-        assert_eq!(
-            event_types(&e1),
-            [
-                "message_start",
-                "content_block_start",
-                "content_block_delta"
-            ]
-        );
+        // reasoning is buffered (not emitted inline) to avoid fragmenting text
+        assert_eq!(event_types(&e1), ["message_start"]);
 
         let e2 = translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "Answer: 42"));
+        // text opens the first content block
         assert_eq!(
             event_types(&e2),
+            ["content_block_start", "content_block_delta"]
+        );
+
+        let e3 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "stop"));
+        // text block closes, then buffered reasoning flushes as a thinking block
+        assert_eq!(
+            event_types(&e3),
             [
                 "content_block_stop",
                 "content_block_start",
-                "content_block_delta"
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta"
             ]
         );
 
-        if let StreamEvent::ContentBlockStart { index, .. } = &e2[1] {
+        // the thinking block is the second content block
+        if let StreamEvent::ContentBlockStart { index, .. } = &e3[1] {
             assert_eq!(*index, 1);
         }
     }
@@ -375,17 +443,22 @@ mod tests {
     fn reasoning_content_produces_thinking_block() {
         let mut state = initial_state("fallback".into());
 
-        let events = translate_chunk(&mut state, &reasoning_content_chunk("1", "gpt-4o", "Think"));
+        // reasoning is buffered, not emitted inline
+        let inline = translate_chunk(&mut state, &reasoning_content_chunk("1", "gpt-4o", "Think"));
+        assert_eq!(event_types(&inline), ["message_start"]);
 
+        // the thinking block is flushed at end of stream
+        let done = translate_done(&mut state);
         assert_eq!(
-            event_types(&events),
+            event_types(&done),
             [
-                "message_start",
                 "content_block_start",
-                "content_block_delta"
+                "content_block_delta",
+                "content_block_stop",
+                "message_stop"
             ]
         );
-        if let StreamEvent::ContentBlockDelta { delta, .. } = &events[2] {
+        if let StreamEvent::ContentBlockDelta { delta, .. } = &done[1] {
             assert!(matches!(delta, Delta::ThinkingDelta { thinking } if thinking == "Think"));
         }
     }
@@ -422,6 +495,55 @@ mod tests {
         if let StreamEvent::MessageDelta { delta, .. } = &e3[1] {
             assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
         }
+    }
+
+    #[test]
+    fn repeated_tool_id_does_not_fragment_block() {
+        // GLM-style streaming: every chunk re-sends id + name and the
+        // arguments arrive in pieces. The proxy must keep a single
+        // tool_use block instead of reopening one per chunk.
+        let mut state = initial_state("fallback".into());
+
+        let chunk = |args: &str| -> openai::StreamChunk {
+            serde_json::from_value(json!({
+                "id": "1", "model": "gpt-4o",
+                "choices": [{ "index": 0, "delta": {
+                    "tool_calls": [{ "index": 0, "id": "call_abc", "type": "function",
+                        "function": { "name": "read_file", "arguments": args } }]
+                }}]
+            }))
+            .unwrap()
+        };
+
+        let e1 = translate_chunk(&mut state, &chunk("{"));
+        let e2 = translate_chunk(&mut state, &chunk("\"path\":\"/tmp\"}"));
+
+        let starts = e1
+            .iter()
+            .chain(e2.iter())
+            .filter(|e| matches!(e, StreamEvent::ContentBlockStart { .. }))
+            .count();
+        assert_eq!(starts, 1, "repeated id must not reopen the tool block");
+
+        // No mid-stream stop (the block must stay open across both chunks).
+        assert!(!e1
+            .iter()
+            .chain(e2.iter())
+            .any(|e| matches!(e, StreamEvent::ContentBlockStop { .. })));
+
+        // Both argument fragments land as deltas on the same block, in order.
+        let deltas: Vec<String> = e1
+            .iter()
+            .chain(e2.iter())
+            .filter_map(|e| match e {
+                StreamEvent::ContentBlockDelta {
+                    delta: Delta::InputJsonDelta { partial_json },
+                    ..
+                } => Some(partial_json.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.concat(), "{\"path\":\"/tmp\"}");
     }
 
     #[test]

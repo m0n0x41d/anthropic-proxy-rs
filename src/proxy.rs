@@ -116,11 +116,33 @@ pub async fn list_models_handler(
 
 fn resolve_api_key(config: &Config, headers: &HeaderMap) -> Option<String> {
     if config.passthrough_api_key {
-        headers
+        // 1) 优先 x-api-key(Anthropic SDK / Claude Code 原生)
+        if let Some(key) = headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
             .filter(|s| !s.is_empty())
-            .map(ToOwned::to_owned)
+        {
+            tracing::debug!("passthrough: key taken from x-api-key header");
+            return Some(key.to_owned());
+        }
+
+        // 2) 兼容 Authorization: Bearer(OpenAI 风格 / CC switch 等中间层)
+        if let Some(key) = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+            .filter(|s| !s.is_empty())
+        {
+            tracing::debug!("passthrough: key taken from Authorization Bearer header");
+            return Some(key.to_owned());
+        }
+
+        let present: Vec<&str> = headers.keys().map(|k| k.as_str()).collect();
+        tracing::warn!(
+            "passthrough enabled but no x-api-key or Authorization Bearer header found; headers received: {:?}",
+            present
+        );
+        None
     } else {
         config.api_key.clone()
     }
@@ -625,15 +647,26 @@ mod tests {
 
         let events = collect_events(chunks, "fallback").await;
 
+        // text block comes first (index 0); reasoning is buffered, not inline
         assert_eq!(events[0]["type"], "message_start");
         assert_eq!(events[1]["type"], "content_block_start");
-        assert_eq!(events[1]["content_block"]["type"], "thinking");
+        assert_eq!(events[1]["content_block"]["type"], "text");
         assert_eq!(events[1]["index"], 0);
-        assert_eq!(events[4]["type"], "content_block_stop");
-        assert_eq!(events[4]["index"], 0);
-        assert_eq!(events[5]["type"], "content_block_start");
-        assert_eq!(events[5]["content_block"]["type"], "text");
-        assert_eq!(events[5]["index"], 1);
+
+        // buffered reasoning flushes as a thinking block (index 1) after text
+        let thinking_start = events
+            .iter()
+            .find(|e| e["content_block"]["type"] == "thinking")
+            .expect("a thinking block");
+        assert_eq!(thinking_start["index"], 1);
+        let thinking_delta = events
+            .iter()
+            .find(|e| e["delta"]["type"] == "thinking_delta")
+            .expect("a thinking delta");
+        assert_eq!(
+            thinking_delta["delta"]["thinking"],
+            "Let me think... more thinking"
+        );
     }
 
     #[tokio::test]
@@ -647,10 +680,18 @@ mod tests {
 
         let events = collect_events(chunks, "fallback").await;
 
-        assert_eq!(events[1]["type"], "content_block_start");
-        assert_eq!(events[1]["content_block"]["type"], "thinking");
-        assert_eq!(events[2]["delta"]["type"], "thinking_delta");
-        assert_eq!(events[2]["delta"]["thinking"], "Let me think...");
+        // reasoning is buffered, then flushed as a thinking block after text
+        let thinking_start = events
+            .iter()
+            .find(|e| e["content_block"]["type"] == "thinking")
+            .expect("a thinking block");
+        assert_eq!(thinking_start["type"], "content_block_start");
+
+        let thinking_delta = events
+            .iter()
+            .find(|e| e["delta"]["type"] == "thinking_delta")
+            .expect("a thinking delta");
+        assert_eq!(thinking_delta["delta"]["thinking"], "Let me think...");
     }
 
     #[tokio::test]

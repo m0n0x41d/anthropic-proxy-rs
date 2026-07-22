@@ -86,6 +86,10 @@ pub enum ContentBlock {
     },
     #[serde(rename = "thinking")]
     Thinking { thinking: String },
+    /// 未知 block 类型(redacted_thinking / server_tool_use / container 等),
+    /// 兜底捕获,避免整体反序列化失败导致 422;转发上游时丢弃。
+    #[serde(other)]
+    Unknown,
 }
 
 /// Content inside a tool_result block: either a plain string or nested content blocks
