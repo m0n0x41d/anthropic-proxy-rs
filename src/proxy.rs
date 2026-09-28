@@ -331,6 +331,11 @@ fn create_sse_stream(
     async_stream::stream! {
         let mut buffer = String::new();
         let mut state = stream::initial_state(fallback_model);
+        // True once the upstream told us the stream is over ([DONE]) or once we
+        // gave up on it (error event). Without this, an upstream that simply
+        // stops sending -- truncation, server close -- leaves the Anthropic
+        // message unclosed and the stashed usage lost.
+        let mut terminated = false;
 
         tokio::pin!(upstream);
 
@@ -351,6 +356,7 @@ fn create_sse_stream(
                         for l in line.lines() {
                             if let Some(data) = l.strip_prefix("data: ") {
                                 if data.trim() == "[DONE]" {
+                                    terminated = true;
                                     for event in stream::translate_done(&mut state) {
                                         yield Ok(Bytes::from(serialize_event(&event)));
                                     }
@@ -370,11 +376,22 @@ fn create_sse_stream(
                 }
                 Err(e) => {
                     tracing::error!("Stream error: {}", e);
+                    // The error event closes the stream; do NOT follow it with
+                    // done events.
+                    terminated = true;
                     for event in stream::translate_error(format!("Stream error: {}", e)) {
                         yield Ok(Bytes::from(serialize_event(&event)));
                     }
                     break;
                 }
+            }
+        }
+
+        // Upstream ran out of data without ever sending [DONE]: close the
+        // Anthropic message anyway so the client sees a well-formed stream.
+        if !terminated {
+            for event in stream::translate_done(&mut state) {
+                yield Ok(Bytes::from(serialize_event(&event)));
             }
         }
     }
@@ -476,14 +493,16 @@ mod tests {
     }
 
     fn make_stream(
-        chunks: Vec<String>,
+        items: Vec<Result<Bytes, TestError>>,
     ) -> impl futures::Stream<Item = Result<Bytes, TestError>> + Send + 'static {
-        stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from(c))))
+        stream::iter(items)
     }
 
-    async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
-        let s = make_stream(chunks);
-        let sse = create_sse_stream(s, model.to_string());
+    async fn collect_events_from_items(
+        items: Vec<Result<Bytes, TestError>>,
+        model: &str,
+    ) -> Vec<Value> {
+        let sse = create_sse_stream(make_stream(items), model.to_string());
         tokio::pin!(sse);
 
         let mut events = Vec::new();
@@ -499,6 +518,14 @@ mod tests {
             }
         }
         events
+    }
+
+    async fn collect_events(chunks: Vec<String>, model: &str) -> Vec<Value> {
+        collect_events_from_items(
+            chunks.into_iter().map(|c| Ok(Bytes::from(c))).collect(),
+            model,
+        )
+        .await
     }
 
     use crate::config::Config;
@@ -698,6 +725,60 @@ mod tests {
         ];
         let events = collect_events(chunks, "fallback").await;
         assert_eq!(events.last().unwrap()["type"], "message_stop");
+    }
+
+    #[tokio::test]
+    async fn upstream_ending_without_done_still_produces_message_stop() {
+        // No `data: [DONE]` frame anywhere: the upstream simply stops sending
+        // (truncation, server close). The Anthropic message must still close.
+        let chunks = vec![
+            openai_chunk("chatcmpl-9", "gpt-4o", Some("Hello"), None),
+            openai_chunk("chatcmpl-9", "gpt-4o", Some(" world"), None),
+            openai_chunk("chatcmpl-9", "gpt-4o", None, Some("stop")),
+        ];
+
+        let events = collect_events(chunks, "fallback").await;
+
+        assert_eq!(events[0]["type"], "message_start");
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "message_stop")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_upstream_still_produces_well_formed_message() {
+        let events = collect_events(vec![], "fallback").await;
+        let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
+        assert_eq!(types, ["message_start", "message_delta", "message_stop"]);
+    }
+
+    #[tokio::test]
+    async fn error_event_is_not_followed_by_done_events() {
+        let items: Vec<Result<Bytes, TestError>> = vec![
+            Ok(Bytes::from(openai_chunk(
+                "chatcmpl-11",
+                "gpt-4o",
+                Some("start"),
+                None,
+            ))),
+            Err(TestError),
+        ];
+
+        let events = collect_events_from_items(items, "fallback").await;
+
+        assert_eq!(events.last().unwrap()["type"], "error");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["type"] == "message_delta" || e["type"] == "message_stop")
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]

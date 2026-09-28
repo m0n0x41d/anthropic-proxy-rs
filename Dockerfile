@@ -1,11 +1,11 @@
-FROM rust:1-slim AS builder
+FROM docker.io/library/rust:1-slim AS builder
 
 WORKDIR /build
 COPY . .
 RUN cargo build --release --locked \
     && strip target/release/anthropic-proxy
 
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

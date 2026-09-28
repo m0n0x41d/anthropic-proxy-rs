@@ -1,6 +1,6 @@
 use crate::models::anthropic::{
     ContentBlockStart, Delta, DeltaUsage, ErrorData, MessageDeltaData, MessageStartData,
-    StreamEvent, Usage,
+    StreamEvent,
 };
 use crate::models::openai;
 use crate::translate::core;
@@ -32,6 +32,15 @@ pub struct StreamState {
     block: BlockState,
     next_index: usize,
     message_started: bool,
+    /// Set once `translate_done` has emitted the closing events. Guards against a
+    /// second call producing a duplicate `message_stop` on a stream that is
+    /// already closed.
+    finished: bool,
+    /// OpenAI delivers usage in a final chunk carrying `choices: []`, which
+    /// arrives *after* the chunk with `finish_reason`. Stash it here so
+    /// `translate_done` can put the real numbers in `message_delta`.
+    pending_usage: Option<openai::Usage>,
+    pending_stop_reason: Option<String>,
 }
 
 pub fn initial_state(fallback_model: String) -> StreamState {
@@ -42,6 +51,32 @@ pub fn initial_state(fallback_model: String) -> StreamState {
         block: BlockState::Idle,
         next_index: 0,
         message_started: false,
+        finished: false,
+        pending_usage: None,
+        pending_stop_reason: None,
+    }
+}
+
+/// Build the `message_start` event for whatever the stream has learned so far.
+/// Shared by `translate_chunk` (first content chunk) and `translate_done`
+/// (a stream that ended before any content chunk ever arrived).
+fn message_start_event(state: &StreamState) -> StreamEvent {
+    StreamEvent::MessageStart {
+        message: MessageStartData {
+            id: state
+                .message_id
+                .clone()
+                .unwrap_or_else(|| "msg_proxy".to_string()),
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            model: state
+                .model
+                .clone()
+                .unwrap_or_else(|| state.fallback_model.clone()),
+            // No usage carried here. See `MessageStartData::usage` -- the honest
+            // value at this point is "unknown", and only an absent field says that.
+            usage: None,
+        },
     }
 }
 
@@ -59,29 +94,21 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
         }
     }
 
+    // The usage chunk carries no choices, so it must be read *before* the
+    // `choices.first()` bail-out below. Reading it after that point -- or only
+    // off the finish_reason chunk, where it is null -- discards the one chunk
+    // that carries the numbers, and every downstream consumer (cost, context
+    // occupancy, auto-compact) is left reading zeros.
+    if chunk.usage.is_some() {
+        state.pending_usage = chunk.usage.clone();
+    }
+
     let Some(choice) = chunk.choices.first() else {
         return events;
     };
 
     if !state.message_started {
-        events.push(StreamEvent::MessageStart {
-            message: MessageStartData {
-                id: state
-                    .message_id
-                    .clone()
-                    .unwrap_or_else(|| "msg_proxy".to_string()),
-                message_type: "message".to_string(),
-                role: "assistant".to_string(),
-                model: state
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| state.fallback_model.clone()),
-                usage: Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                },
-            },
-        });
+        events.push(message_start_event(state));
         state.message_started = true;
     }
 
@@ -103,14 +130,61 @@ pub fn translate_chunk(state: &mut StreamState, chunk: &openai::StreamChunk) -> 
     }
 
     if let Some(finish_reason) = &choice.finish_reason {
-        emit_finish(&mut events, state, finish_reason, chunk.usage.as_ref());
+        // Do NOT emit `message_delta` here. The usage chunk has not arrived yet,
+        // and `message_delta` is the only place its numbers can go. Record the
+        // stop reason and let `translate_done` emit once the usage is in hand.
+        close_current_block(&mut events, state);
+        state.pending_stop_reason = core::map_stop_reason(Some(finish_reason));
     }
 
     events
 }
 
-pub fn translate_done(_state: &mut StreamState) -> Vec<StreamEvent> {
-    vec![StreamEvent::MessageStop]
+pub fn translate_done(state: &mut StreamState) -> Vec<StreamEvent> {
+    // Idempotent: a second call has nothing left to close and must not produce a
+    // second `message_stop` on an already-finished message.
+    if state.finished {
+        return Vec::new();
+    }
+    state.finished = true;
+
+    let mut events = Vec::new();
+
+    // A stream that ended before any content chunk -- e.g. one carrying only a
+    // usage chunk, or an empty stream -- never opened the message. Emitting
+    // `message_delta` without a preceding `message_start` makes the Anthropic
+    // SDK reject the stream outright ("got message_delta before message_start"),
+    // so open it here with whatever metadata we have.
+    if !state.message_started {
+        events.push(message_start_event(state));
+        state.message_started = true;
+    }
+
+    // A stream that ended without a finish_reason would otherwise leave its
+    // content block open; closing here is a no-op when already closed.
+    close_current_block(&mut events, state);
+
+    let stop_reason = state
+        .pending_stop_reason
+        .clone()
+        .unwrap_or_else(|| "end_turn".to_string());
+
+    events.push(StreamEvent::MessageDelta {
+        delta: MessageDeltaData {
+            stop_reason: Some(stop_reason),
+            stop_sequence: None,
+        },
+        usage: DeltaUsage {
+            input_tokens: state.pending_usage.as_ref().map(|u| u.prompt_tokens),
+            output_tokens: state
+                .pending_usage
+                .as_ref()
+                .map(|u| u.completion_tokens)
+                .unwrap_or(0),
+        },
+    });
+    events.push(StreamEvent::MessageStop);
+    events
 }
 
 pub fn translate_error(message: String) -> Vec<StreamEvent> {
@@ -126,6 +200,10 @@ fn close_current_block(events: &mut Vec<StreamEvent>, state: &mut StreamState) {
     if let Some(index) = state.block.current_index() {
         events.push(StreamEvent::ContentBlockStop { index });
         state.next_index = index + 1;
+        // Reset, or a second call re-emits `content_block_stop` for a block
+        // that is already closed. `translate_done` relies on this being a no-op
+        // on the normal path, where finish_reason closed the block already.
+        state.block = BlockState::Idle;
     }
 }
 
@@ -214,28 +292,6 @@ fn emit_tool_calls(
     }
 }
 
-fn emit_finish(
-    events: &mut Vec<StreamEvent>,
-    state: &mut StreamState,
-    finish_reason: &str,
-    usage: Option<&openai::Usage>,
-) {
-    close_current_block(events, state);
-
-    let stop_reason = core::map_stop_reason(Some(finish_reason));
-
-    events.push(StreamEvent::MessageDelta {
-        delta: MessageDeltaData {
-            stop_reason,
-            stop_sequence: None,
-        },
-        usage: DeltaUsage {
-            input_tokens: usage.map(|u| u.prompt_tokens),
-            output_tokens: usage.map(|u| u.completion_tokens).unwrap_or(0),
-        },
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,17 +329,21 @@ mod tests {
         .unwrap()
     }
 
-    fn finish_chunk_with_usage(
+    /// The shape OpenAI actually sends with `stream_options.include_usage`: a
+    /// trailing chunk with NO choices, carrying only the numbers. The fixture
+    /// this replaces put `usage` on the finish_reason chunk -- a shape no
+    /// upstream emits -- which is exactly why the suite stayed green while the
+    /// numbers were being dropped on the floor.
+    fn usage_only_chunk(
         id: &str,
         model: &str,
-        reason: &str,
         prompt_tokens: u32,
         completion_tokens: u32,
     ) -> openai::StreamChunk {
         serde_json::from_value(json!({
             "id": id,
             "model": model,
-            "choices": [{ "index": 0, "delta": {}, "finish_reason": reason }],
+            "choices": [],
             "usage": {
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
@@ -336,10 +396,10 @@ mod tests {
         assert_eq!(event_types(&e2), ["content_block_delta"]);
 
         let e3 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "stop"));
-        assert_eq!(event_types(&e3), ["content_block_stop", "message_delta"]);
+        assert_eq!(event_types(&e3), ["content_block_stop"]);
 
         let e4 = translate_done(&mut state);
-        assert_eq!(event_types(&e4), ["message_stop"]);
+        assert_eq!(event_types(&e4), ["message_delta", "message_stop"]);
     }
 
     #[test]
@@ -417,29 +477,170 @@ mod tests {
         assert_eq!(event_types(&e2), ["content_block_delta"]);
 
         let e3 = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "tool_calls"));
-        assert_eq!(event_types(&e3), ["content_block_stop", "message_delta"]);
+        assert_eq!(event_types(&e3), ["content_block_stop"]);
 
-        if let StreamEvent::MessageDelta { delta, .. } = &e3[1] {
+        let e4 = translate_done(&mut state);
+        assert_eq!(event_types(&e4), ["message_delta", "message_stop"]);
+
+        if let StreamEvent::MessageDelta { delta, .. } = &e4[0] {
             assert_eq!(delta.stop_reason.as_deref(), Some("tool_use"));
         }
     }
 
     #[test]
-    fn finish_chunk_with_usage_maps_input_and_output_tokens() {
+    fn usage_arriving_after_finish_reason_reaches_message_delta() {
         let mut state = initial_state("fallback".into());
 
         translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "Hello"));
-        let events = translate_chunk(
-            &mut state,
-            &finish_chunk_with_usage("1", "gpt-4o", "stop", 7, 3),
+
+        // finish_reason closes the block but must NOT emit message_delta yet.
+        let finish = translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "stop"));
+        assert_eq!(event_types(&finish), ["content_block_stop"]);
+
+        // The usage chunk carries no choices and emits nothing of its own.
+        let usage_chunk = translate_chunk(&mut state, &usage_only_chunk("1", "gpt-4o", 7, 3));
+        assert!(
+            usage_chunk.is_empty(),
+            "usage-only chunk must not emit events, but got {:?}",
+            event_types(&usage_chunk)
         );
 
-        if let StreamEvent::MessageDelta { usage, .. } = &events[1] {
+        let events = translate_done(&mut state);
+        assert_eq!(event_types(&events), ["message_delta", "message_stop"]);
+
+        if let StreamEvent::MessageDelta { delta, usage } = &events[0] {
+            assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
             assert_eq!(usage.input_tokens, Some(7));
             assert_eq!(usage.output_tokens, 3);
         } else {
             panic!("expected message_delta");
         }
+    }
+
+    #[test]
+    fn usage_is_kept_whatever_order_it_arrives_in() {
+        let mut state = initial_state("fallback".into());
+
+        // Upstream that reports usage early, then finishes.
+        translate_chunk(&mut state, &usage_only_chunk("1", "gpt-4o", 11, 5));
+        translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "length"));
+
+        let events = translate_done(&mut state);
+        if let StreamEvent::MessageDelta { delta, usage } = &events[0] {
+            assert_eq!(delta.stop_reason.as_deref(), Some("max_tokens"));
+            assert_eq!(usage.input_tokens, Some(11));
+            assert_eq!(usage.output_tokens, 5);
+        } else {
+            panic!("expected message_delta");
+        }
+    }
+
+    #[test]
+    fn done_without_finish_reason_still_emits_message_delta() {
+        let mut state = initial_state("fallback".into());
+        translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "truncated"));
+
+        let events = translate_done(&mut state);
+        assert_eq!(
+            event_types(&events),
+            ["content_block_stop", "message_delta", "message_stop"]
+        );
+        if let StreamEvent::MessageDelta { delta, usage } = &events[1] {
+            assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
+            assert_eq!(usage.input_tokens, None);
+            assert_eq!(usage.output_tokens, 0);
+        } else {
+            panic!("expected message_delta");
+        }
+    }
+
+    #[test]
+    fn done_with_no_prior_chunk_emits_well_formed_message_start() {
+        let mut state = initial_state("my-fallback".into());
+
+        let events = translate_done(&mut state);
+        assert_eq!(
+            event_types(&events),
+            ["message_start", "message_delta", "message_stop"]
+        );
+
+        if let StreamEvent::MessageStart { message } = &events[0] {
+            assert_eq!(message.id, "msg_proxy");
+            assert_eq!(message.message_type, "message");
+            assert_eq!(message.role, "assistant");
+            assert_eq!(message.model, "my-fallback");
+            assert!(
+                message.usage.is_none(),
+                "message_start must not carry a zero-filled usage; the real numbers \
+                 belong to message_delta"
+            );
+        } else {
+            panic!("expected message_start");
+        }
+    }
+
+    #[test]
+    fn usage_only_stream_still_opens_with_message_start() {
+        // The real-world shape: upstream sends nothing but the trailing usage
+        // chunk, which carries no choices and so never opened the message.
+        let mut state = initial_state("fallback".into());
+
+        translate_chunk(&mut state, &usage_only_chunk("chatcmpl-9", "gpt-4o", 21, 4));
+
+        let events = translate_done(&mut state);
+        assert_eq!(
+            event_types(&events),
+            ["message_start", "message_delta", "message_stop"]
+        );
+
+        if let StreamEvent::MessageStart { message } = &events[0] {
+            assert_eq!(message.id, "chatcmpl-9");
+            assert_eq!(message.model, "gpt-4o");
+        } else {
+            panic!("expected message_start");
+        }
+
+        if let StreamEvent::MessageDelta { usage, .. } = &events[1] {
+            assert_eq!(usage.input_tokens, Some(21));
+            assert_eq!(usage.output_tokens, 4);
+        } else {
+            panic!("expected message_delta");
+        }
+    }
+
+    #[test]
+    fn translate_done_is_idempotent() {
+        let mut state = initial_state("fallback".into());
+        translate_chunk(&mut state, &text_chunk("1", "gpt-4o", "hi"));
+        translate_chunk(&mut state, &finish_chunk("1", "gpt-4o", "stop"));
+
+        let first = translate_done(&mut state);
+        assert_eq!(event_types(&first), ["message_delta", "message_stop"]);
+
+        let second = translate_done(&mut state);
+        assert!(
+            second.is_empty(),
+            "second translate_done must emit nothing, but got {:?}",
+            event_types(&second)
+        );
+    }
+
+    #[test]
+    fn translate_done_is_idempotent_even_when_it_opened_the_message_itself() {
+        let mut state = initial_state("fallback".into());
+
+        let first = translate_done(&mut state);
+        assert_eq!(
+            event_types(&first),
+            ["message_start", "message_delta", "message_stop"]
+        );
+
+        let second = translate_done(&mut state);
+        assert!(
+            second.is_empty(),
+            "second translate_done must emit nothing, but got {:?}",
+            event_types(&second)
+        );
     }
 
     #[test]

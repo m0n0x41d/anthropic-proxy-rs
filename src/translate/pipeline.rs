@@ -35,13 +35,18 @@ pub fn translate_request(
                 });
             }
             anthropic::SystemPrompt::Multiple(messages) => {
-                for msg in messages {
+                // Merge system blocks into one system message. Some models
+                // only accept one system message (position 0) & reject others.
+                let merged = messages
+                    .into_iter()
+                    .map(|msg| sanitize_prompt(msg.text, &policy.ignore_terms))
+                    .filter(|text| !text.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                if !merged.is_empty() {
                     openai_messages.push(openai::Message {
                         role: "system".to_string(),
-                        content: Some(openai::MessageContent::Text(sanitize_prompt(
-                            msg.text,
-                            &policy.ignore_terms,
-                        ))),
+                        content: Some(openai::MessageContent::Text(merged)),
                         reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -55,6 +60,8 @@ pub fn translate_request(
     for msg in req.messages {
         openai_messages.extend(core::translate_message(msg)?);
     }
+
+    fold_trailing_system_messages(&mut openai_messages);
 
     let tools = req.tools.and_then(|tools| {
         let filtered: Vec<_> = tools
@@ -168,6 +175,22 @@ pub fn translate_models_list(resp: openai::ModelsListResponse) -> anthropic::Mod
         first_id,
         has_more: false,
         last_id,
+    }
+}
+
+/// Some models (e.g., Qwen) only accept one system message (position 0) &
+/// reject others; we'll keep the leading run where it is & rewrite any system
+/// message appearing later as a 'user' turn so the model still sees the text.
+fn fold_trailing_system_messages(messages: &mut [openai::Message]) {
+    let mut seen_non_system = false;
+    for msg in messages.iter_mut() {
+        if msg.role == "system" {
+            if seen_non_system {
+                msg.role = "user".to_string();
+            }
+        } else {
+            seen_non_system = true;
+        }
     }
 }
 
@@ -593,7 +616,53 @@ mod tests {
             .iter()
             .filter(|m| m.role == "system")
             .collect();
-        assert_eq!(system_msgs.len(), 2);
+        assert_eq!(system_msgs.len(), 1);
+        assert_eq!(openai.messages[0].role, "system");
+        match &openai.messages[0].content {
+            Some(openai::MessageContent::Text(text)) => {
+                assert_eq!(text, "You are helpful.\n\nBe concise.");
+            }
+            _ => panic!("expected merged text system prompt"),
+        }
+    }
+
+    #[test]
+    fn folds_mid_conversation_system_messages_into_user_turns() {
+        let req = anthropic::AnthropicRequest {
+            model: "gpt-4o".to_string(),
+            messages: vec![
+                anthropic::Message {
+                    role: "user".to_string(),
+                    content: anthropic::MessageContent::Text("hi".to_string()),
+                },
+                anthropic::Message {
+                    role: "system".to_string(),
+                    content: anthropic::MessageContent::Text("reminder".to_string()),
+                },
+                anthropic::Message {
+                    role: "assistant".to_string(),
+                    content: anthropic::MessageContent::Text("hello".to_string()),
+                },
+            ],
+            max_tokens: 100,
+            system: Some(anthropic::SystemPrompt::Single("Be helpful.".to_string())),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            stream: None,
+            tools: None,
+            metadata: None,
+            extra: json!({}),
+        };
+
+        let openai = translate_request(req, &default_policy()).unwrap();
+        let roles: Vec<&str> = openai.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "user", "assistant"]);
+        match &openai.messages[2].content {
+            Some(openai::MessageContent::Text(text)) => assert_eq!(text, "reminder"),
+            _ => panic!("expected folded system text to survive as user content"),
+        }
     }
 
     #[test]

@@ -209,7 +209,14 @@ pub struct MessageStartData {
     pub message_type: String,
     pub role: String,
     pub model: String,
-    pub usage: Usage,
+    /// Absent rather than zero-filled. At `message_start` the upstream has not
+    /// reported anything yet: `output_tokens: 0` would be true, but
+    /// `input_tokens: 0` would be a fabricated measurement, and a consumer
+    /// cannot tell the two apart -- a zero-filled object is truthy, so anything
+    /// reading it takes the zero as a reading. The real numbers arrive in the
+    /// terminal `message_delta`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
