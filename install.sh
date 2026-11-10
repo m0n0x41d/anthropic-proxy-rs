@@ -71,7 +71,8 @@ try_binary_install() {
     local base_url="https://github.com/${repo}/releases"
 
     if [[ -z "$tag" ]]; then
-        tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${base_url}/latest" 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)"
+        tag="$(curl -fsSL -o /dev/null -w '%{url_effective}' "${base_url}/latest" 2>/dev/null \
+               | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' || true)"
         if [[ -z "$tag" ]]; then
             echo "Could not detect latest release" >&2
             return 1
@@ -80,7 +81,6 @@ try_binary_install() {
 
     local archive_name="${DEFAULT_PACKAGE_NAME}-${target}.tar.gz"
     local url="${base_url}/download/${tag}/${archive_name}"
-
     echo "Downloading ${DEFAULT_PACKAGE_NAME} ${tag} for ${target}..."
 
     local tmpdir
@@ -93,12 +93,49 @@ try_binary_install() {
         wget -q "$url" -O "${tmpdir}/${archive_name}" || return 1
     fi
 
-    tar xzf "${tmpdir}/${archive_name}" -C "$tmpdir"
+    # --- checksum verification ---
+    local sums_url="${base_url}/download/${tag}/SHA256SUMS"
+    if need_cmd curl; then
+        curl -fsSL "$sums_url" -o "${tmpdir}/SHA256SUMS" 2>/dev/null || true
+    else
+        wget -q "$sums_url" -O "${tmpdir}/SHA256SUMS" 2>/dev/null || true
+    fi
 
+    if [[ -f "${tmpdir}/SHA256SUMS" ]]; then
+        local expected
+        expected="$(grep "${archive_name}" "${tmpdir}/SHA256SUMS" | awk '{print $1}')"
+        if [[ -n "$expected" ]]; then
+            local actual
+            if command -v sha256sum >/dev/null 2>&1; then
+                actual="$(sha256sum "${tmpdir}/${archive_name}" | awk '{print $1}')"
+            elif command -v shasum >/dev/null 2>&1; then
+                actual="$(shasum -a 256 "${tmpdir}/${archive_name}" | awk '{print $1}')"
+            else
+                echo "WARNING: no sha256sum/shasum available, skipping checksum verification" >&2
+                actual=""
+            fi
+
+            if [[ -n "$actual" ]]; then
+                if [[ "$actual" != "$expected" ]]; then
+                    echo "ERROR: checksum mismatch for ${archive_name}" >&2
+                    echo "  expected: ${expected}" >&2
+                    echo "  actual:   ${actual}" >&2
+                    return 1
+                fi
+                echo "Checksum verified ✓"
+            fi
+        else
+            echo "WARNING: ${archive_name} not found in SHA256SUMS, skipping verification" >&2
+        fi
+    else
+        echo "WARNING: SHA256SUMS not available for ${tag}, skipping verification" >&2
+    fi
+    # --- end checksum verification ---
+
+    tar xzf "${tmpdir}/${archive_name}" -C "$tmpdir"
     mkdir -p "$install_dir"
     mv "${tmpdir}/${DEFAULT_PACKAGE_NAME}" "${install_dir}/${DEFAULT_PACKAGE_NAME}"
     chmod +x "${install_dir}/${DEFAULT_PACKAGE_NAME}"
-
     echo "Installed ${DEFAULT_PACKAGE_NAME} ${tag} to ${install_dir}/${DEFAULT_PACKAGE_NAME}"
 }
 
