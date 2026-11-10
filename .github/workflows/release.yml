@@ -81,6 +81,12 @@ jobs:
           merge-multiple: true
           path: artifacts
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
